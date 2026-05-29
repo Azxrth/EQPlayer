@@ -3,10 +3,9 @@
   "version": "0.0.1",
   "private": true,
   "scripts": {
-    "android": "react-native run-android",
-    "ios": "react-native run-ios",
+    "android": "cd android && ./gradlew installDebug",
     "lint": "eslint .",
-    "start": "react-native start",
+    "start": "node node_modules/metro/src/cli.js serve --config node_modules/@react-native/metro-config/src/index.js",
     "test": "jest"
   },
   "dependencies": {
@@ -14,14 +13,17 @@
     "@react-native/new-app-screen": "0.85.3",
     "@react-navigation/native": "^7.2.5",
     "@react-navigation/stack": "^7.9.3",
+    "@types/react-native-vector-icons": "^6.4.18",
+    "picomatch": "^4.0.4",
     "react": "19.2.3",
     "react-native": "0.85.3",
     "react-native-image-colors": "^2.6.0",
     "react-native-safe-area-context": "^5.8.0",
-    "react-native-screens": "^4.25.2"
+    "react-native-screens": "^4.25.2",
+    "react-native-vector-icons": "^10.3.0"
   },
   "devDependencies": {
-    "@babel/core": "^7.25.2",
+    "@babel/core": "7.29.7",
     "@babel/preset-env": "^7.25.3",
     "@babel/runtime": "^7.29.7",
     "@react-native-community/cli": "20.1.0",
