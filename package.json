@@ -5,11 +5,13 @@
   "scripts": {
     "android": "cd android && ./gradlew installDebug",
     "lint": "eslint .",
-    "start": "node node_modules/metro/src/cli.js serve --config node_modules/@react-native/metro-config/src/index.js",
-    "test": "jest"
+    "start": "react-native start",
+    "test": "jest",
+    "postinstall": "patch-package"
   },
   "dependencies": {
     "@babel/code-frame": "^7.29.7",
+    "@react-native-async-storage/async-storage": "^3.1.1",
     "@react-native/new-app-screen": "0.85.3",
     "@react-navigation/native": "^7.2.5",
     "@react-navigation/stack": "^7.9.3",
@@ -40,6 +42,8 @@
     "@types/react-test-renderer": "^19.1.0",
     "eslint": "^8.19.0",
     "jest": "^29.6.3",
+    "patch-package": "^8.0.1",
+    "postinstall-postinstall": "^2.1.0",
     "prettier": "2.8.8",
     "react-test-renderer": "19.2.3",
     "typescript": "^5.8.3"
