@@ -482,8 +482,8 @@ function fmtTime(sec: number): string {
 }
 
 // ─── Player ───────────────────────────────────────────────────────────────────
-const PlayerScreen = ({track, onClose, queue, onRemoveFromQueue, eq, onOpenEq}: {
-  track: Track; onClose: () => void; queue: Track[]; onRemoveFromQueue: (id: string) => void;
+const PlayerScreen = ({track, onClose, eq, onOpenEq}: {
+  track: Track; onClose: () => void;
   eq: EqApi; onOpenEq: () => void;
 }) => {
   const [addOpen,   setAddOpen]   = useState(false);
@@ -493,6 +493,30 @@ const PlayerScreen = ({track, onClose, queue, onRemoveFromQueue, eq, onOpenEq}: 
 
   // Vrais contrôles depuis usePlayer
   const {isPlaying, isLoading, progress, activeTrack, playMode, togglePlay, skipNext, skipPrev, seekTo, cyclePlayMode} = usePlayer();
+
+  // File d'attente réelle (morceaux à venir), rafraîchie quand le morceau change.
+  const [upNext, setUpNext] = useState<any[]>([]);
+  const refreshQueue = useCallback(async () => {
+    try {
+      const q = await TrackPlayer.getQueue();
+      const idx = (await TrackPlayer.getActiveTrackIndex()) ?? 0;
+      setUpNext(q.slice(idx + 1).map((t: any, i: number) => ({...t, _qIndex: idx + 1 + i})));
+    } catch { /* lecteur pas prêt */ }
+  }, []);
+  useEffect(() => {
+    refreshQueue();
+    const t = setTimeout(refreshQueue, 400); // au cas où la file vient d'être (re)construite
+    return () => clearTimeout(t);
+  }, [activeTrack, isPlaying, refreshQueue]);
+
+  const jumpTo = useCallback(async (index: number) => {
+    await TrackPlayer.skip(index).catch(() => {});
+    await TrackPlayer.play();
+  }, []);
+  const removeAt = useCallback(async (index: number) => {
+    await TrackPlayer.remove([index]).catch(() => {});
+    refreshQueue();
+  }, [refreshQueue]);
 
   // Largeur de la barre = largeur écran - paddings (24 de chaque côté).
   const TRACK_W = width - 48;
@@ -648,22 +672,28 @@ const PlayerScreen = ({track, onClose, queue, onRemoveFromQueue, eq, onOpenEq}: 
           </View>
         )}
 
-        {/* Queue */}
+        {/* File d'attente — morceaux à venir, cliquables */}
         <View style={pS.section}>
           <Text style={pS.sectionTitle}>File d'attente</Text>
-          {queue.map(t => (
-            <View key={t.id} style={pS.queueRow}>
-              <View style={[pS.queueCover, {backgroundColor:coverBg(t.genre)}]}>
-                <MaterialCommunityIcons name="music" size={14} color="#ffffff44"/>
-              </View>
+          {upNext.length === 0 ? (
+            <Text style={[pS.timeText, {paddingVertical:12}]}>Aucun morceau à suivre.</Text>
+          ) : upNext.map(t => (
+            <TouchableOpacity key={t._qIndex} style={pS.queueRow} activeOpacity={0.7} onPress={() => jumpTo(t._qIndex)}>
+              {t.artwork ? (
+                <Image source={{uri: t.artwork}} style={pS.queueCover} resizeMode="cover"/>
+              ) : (
+                <View style={[pS.queueCover, {backgroundColor:coverBg(t.genre)}]}>
+                  <MaterialCommunityIcons name="music" size={14} color="#ffffff44"/>
+                </View>
+              )}
               <View style={pS.queueMeta}>
                 <Text style={pS.queueTitle} numberOfLines={1}>{t.title}</Text>
                 <Text style={pS.queueArtist} numberOfLines={1}>{t.artist}</Text>
               </View>
-              <TouchableOpacity onPress={() => onRemoveFromQueue(t.id)} style={pS.queueRemove}>
+              <TouchableOpacity onPress={() => removeAt(t._qIndex)} style={pS.queueRemove}>
                 <MaterialCommunityIcons name="close" size={16} color="#555"/>
               </TouchableOpacity>
-            </View>
+            </TouchableOpacity>
           ))}
         </View>
       </ScrollView>
@@ -710,7 +740,7 @@ const pS = StyleSheet.create({
   eqOpenHint:    {fontSize:12, color:'#ffffff88', marginRight:2},
   eqRow:         {flexDirection:'row', alignItems:'flex-end', height:EQ_HEIGHT+24, gap:4},
   queueRow:      {flexDirection:'row', alignItems:'center', gap:10, paddingVertical:10, borderBottomWidth:0.5, borderBottomColor:'#ffffff11'},
-  queueCover:    {width:36, height:36, borderRadius:5, alignItems:'center', justifyContent:'center'},
+  queueCover:    {width:36, height:36, borderRadius:5, overflow:'hidden', alignItems:'center', justifyContent:'center'},
   queueMeta:     {flex:1},
   queueTitle:    {fontSize:13, fontWeight:'500', color:'#fff'},
   queueArtist:   {fontSize:11, color:'#ffffff55', marginTop:1},
@@ -1922,8 +1952,6 @@ export default function App() {
         <PlayerScreen
           track={currentTrack}
           onClose={() => setPlayerOpen(false)}
-          queue={tracks.slice(0, 30)}
-          onRemoveFromQueue={() => {}}
           eq={{range: peqRange, bands: eqBands, onGainLive, onGainCommit, onSetFreq, onAddBand, onRemoveBand, onReset: onResetBands}}
           onOpenEq={() => setEqOpen(true)}
         />
