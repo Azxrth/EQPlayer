@@ -28,7 +28,7 @@ import {setupPlayer, usePlayer, toPlayerTrack} from './src/usePlayer';
 import {usePlaylists, createPlaylist, renamePlaylist, deletePlaylist, toggleTrack, removeTrack, type Playlist} from './src/usePlaylists';
 import {useFavorites, toggleFavorite} from './src/useFavorites';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import {getEqInfo, applyPreset, applyLevels, setBandLevel, setEnabled as setEqEnabled, freqLabel, type EqInfo} from './src/equalizer';
+import {peqGetInfo, peqConfigure, peqSetGain, peqSetEnabled, presetGainsFor, hzLabel, type PeqBand} from './src/peq';
 
 // ─── Thème clair / sombre ───────────────────────────────────────────────────────
 // Tokens sémantiques : seul le « chrome » de l'app est thématisé.
@@ -217,14 +217,12 @@ function eqInterp(pts: {hz: number; db: number}[], hz: number): number {
   return 0;
 }
 
+const EQ_MAX_BANDS = 15;
+
 // Courbe de réponse : aire remplie approximée par des barres fines (sans SVG).
-const EqCurve = ({info, levels, bright}: {info: EqInfo; levels: number[]; bright: string}) => {
-  const minDb = info.minLevel / 100;
-  const maxDb = info.maxLevel / 100;
+const EqCurve = ({bands, minDb, maxDb, bright}: {bands: PeqBand[]; minDb: number; maxDb: number; bright: string}) => {
   const span = (maxDb - minDb) || 1;
-  const pts = info.bands
-    .map((b, i) => ({hz: b.centerFreq / 1000, db: (levels[i] ?? b.level) / 100}))
-    .sort((a, b) => a.hz - b.hz);
+  const pts = bands.map(b => ({hz: b.freq, db: b.gain})).sort((a, b) => a.hz - b.hz);
   const lnMin = Math.log(20), lnMax = Math.log(20000);
   const zeroH = ((0 - minDb) / span) * EQ_CURVE_H;
   return (
@@ -242,80 +240,138 @@ const EqCurve = ({info, levels, bright}: {info: EqInfo; levels: number[]; bright
   );
 };
 
-// Slider de bande : zone tactile large, application audio en temps réel.
-const EqBand = ({bandIndex, label, bright, min, max, value, onCommit}: {
-  bandIndex: number; label: string; bright: string; min: number; max: number; value: number; onCommit: (mb: number) => void;
+// Slider de bande : gain draggable (audio live) + fréquence éditable au tap.
+const EqBand = ({freq, gain, bright, minDb, maxDb, onLive, onCommit, onEditFreq}: {
+  freq: number; gain: number; bright: string; minDb: number; maxDb: number;
+  onLive: (db: number) => void; onCommit: (db: number) => void; onEditFreq: () => void;
 }) => {
-  const span = (max - min) || 1;
-  const [mb, setMb] = useState(value);
-  const mbRef = useRef(mb); mbRef.current = mb;
-  const startRef = useRef(mb);
-  // Synchronise quand la valeur change de l'extérieur (préréglage appliqué)
-  useEffect(() => { setMb(value); }, [value]);
+  const span = (maxDb - minDb) || 1;
+  const [db, setDb] = useState(gain);
+  const dbRef = useRef(db); dbRef.current = db;
+  const startRef = useRef(db);
+  // Synchronise quand la valeur change de l'extérieur (préréglage / reconfig)
+  useEffect(() => { setDb(gain); }, [gain]);
 
   const pan = useRef(
     PanResponder.create({
       onStartShouldSetPanResponder: () => true,
       onMoveShouldSetPanResponder: () => true,
-      onPanResponderGrant: () => { startRef.current = mbRef.current; setEqEnabled(true); },
+      onPanResponderGrant: () => { startRef.current = dbRef.current; },
       onPanResponderMove: (_, gs) => {
-        const startRatio = (startRef.current - min) / span;
+        const startRatio = (startRef.current - minDb) / span;
         const r = Math.max(0, Math.min(1, startRatio - gs.dy / EQ_HEIGHT));
-        const v = Math.round(min + r * span);
-        setMb(v);
-        setBandLevel(bandIndex, v); // audio en temps réel pendant le glissement
+        const v = Math.round((minDb + r * span) * 10) / 10;
+        setDb(v);
+        onLive(v); // audio en temps réel pendant le glissement
       },
-      onPanResponderRelease: () => { onCommit(Math.round(mbRef.current)); },
+      onPanResponderRelease: () => { onCommit(dbRef.current); },
     }),
   ).current;
 
-  const ratio = Math.max(0, Math.min(1, (mb - min) / span));
-  const zeroRatio = Math.max(0, Math.min(1, (0 - min) / span));
+  const ratio = Math.max(0, Math.min(1, (db - minDb) / span));
+  const zeroRatio = Math.max(0, Math.min(1, (0 - minDb) / span));
   const knobBottom = ratio * EQ_HEIGHT;
   const segBottom = Math.min(ratio, zeroRatio) * EQ_HEIGHT;
   const segHeight = Math.abs(ratio - zeroRatio) * EQ_HEIGHT;
-  const db = mb / 100;
 
   return (
-    <View style={eqS.band}>
+    <View style={eqS.bandCol}>
       <Text style={[eqS.gain, {color: bright}]}>{db > 0 ? '+' : ''}{db.toFixed(1)}</Text>
       <View style={[eqS.slider, {height: EQ_HEIGHT}]} {...pan.panHandlers}>
         <View style={eqS.sliderTrack}/>
         <View style={[eqS.seg, {bottom: segBottom, height: segHeight, backgroundColor: bright}]}/>
         <View style={[eqS.knob, {bottom: knobBottom - 9, backgroundColor: bright}]}/>
       </View>
-      <Text style={eqS.freq}>{label}</Text>
+      <TouchableOpacity onPress={onEditFreq} hitSlop={{top:8, bottom:8, left:6, right:6}}>
+        <Text style={[eqS.freq, {color: bright}]}>{hzLabel(freq)}</Text>
+      </TouchableOpacity>
     </View>
   );
 };
 
-// Panneau égaliseur complet : courbe + sliders + échelle de gain.
-const Equalizer = ({info, levels, bright, onBandChange}: {
-  info: EqInfo; levels: number[]; bright: string; onBandChange: (band: number, mb: number) => void;
+// Modale : éditer la fréquence (Hz) d'une bande ou la supprimer.
+const FreqEditModal = ({visible, freq, onClose, onSubmit, onRemove}: {
+  visible: boolean; freq: number; onClose: () => void; onSubmit: (hz: number) => void; onRemove: () => void;
 }) => {
-  const maxDb = Math.round(info.maxLevel / 100);
+  const {setS} = useStyles();
+  const c = useColors();
+  const [val, setVal] = useState(String(Math.round(freq)));
+  useEffect(() => { if (visible) setVal(String(Math.round(freq))); }, [visible, freq]);
+  const submit = () => {
+    const hz = parseInt(val, 10);
+    if (hz >= 20 && hz <= 20000) onSubmit(hz);
+    onClose();
+  };
+  return (
+    <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
+      <TouchableOpacity style={setS.centerBackdrop} activeOpacity={1} onPress={onClose}>
+        <TouchableOpacity style={setS.dialog} activeOpacity={1}>
+          <Text style={setS.dialogTitle}>Fréquence (Hz)</Text>
+          <TextInput
+            style={setS.input}
+            value={val}
+            onChangeText={setVal}
+            keyboardType="number-pad"
+            autoFocus
+            returnKeyType="done"
+            onSubmitEditing={submit}
+            placeholder="20 – 20000"
+            placeholderTextColor={c.iconDim}/>
+          <View style={setS.dialogActions}>
+            <TouchableOpacity style={setS.dialogBtn} onPress={() => { onRemove(); onClose(); }}>
+              <Text style={[setS.dialogBtnText, {color:'#ff4d6d'}]}>Supprimer</Text>
+            </TouchableOpacity>
+            <View style={{flex:1}}/>
+            <TouchableOpacity style={setS.dialogBtn} onPress={onClose}>
+              <Text style={setS.dialogBtnText}>Annuler</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={setS.dialogBtn} onPress={submit}>
+              <Text style={setS.dialogBtnPrimary}>OK</Text>
+            </TouchableOpacity>
+          </View>
+        </TouchableOpacity>
+      </TouchableOpacity>
+    </Modal>
+  );
+};
+
+// Panneau égaliseur paramétrique : courbe + sliders + fréquences éditables.
+const ParametricEq = ({bands, minDb, maxDb, bright, onGainLive, onGainCommit, onSetFreq, onRemoveBand}: {
+  bands: PeqBand[]; minDb: number; maxDb: number; bright: string;
+  onGainLive: (i: number, db: number) => void; onGainCommit: (i: number, db: number) => void;
+  onSetFreq: (i: number, hz: number) => void; onRemoveBand: (i: number) => void;
+}) => {
+  const [editing, setEditing] = useState<number | null>(null);
   return (
     <View style={eqS.panel}>
-      <EqCurve info={info} levels={levels} bright={bright}/>
-      <View style={eqS.bandsRow}>
+      <EqCurve bands={bands} minDb={minDb} maxDb={maxDb} bright={bright}/>
+      <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={eqS.bandsRow}>
         <View style={eqS.scale}>
           <Text style={eqS.scaleTxt}>+{maxDb}</Text>
           <Text style={eqS.scaleTxt}>0</Text>
-          <Text style={eqS.scaleTxt}>-{maxDb}</Text>
+          <Text style={eqS.scaleTxt}>-{Math.abs(minDb)}</Text>
         </View>
-        {info.bands.map((band, i) => (
+        {bands.map((b, i) => (
           <EqBand
-            key={band.index}
-            bandIndex={band.index}
-            label={freqLabel(band.centerFreq)}
+            key={i}
+            freq={b.freq}
+            gain={b.gain}
             bright={bright}
-            min={info.minLevel}
-            max={info.maxLevel}
-            value={levels[i] ?? band.level}
-            onCommit={mb => onBandChange(band.index, mb)}
+            minDb={minDb}
+            maxDb={maxDb}
+            onLive={db => onGainLive(i, db)}
+            onCommit={db => onGainCommit(i, db)}
+            onEditFreq={() => setEditing(i)}
           />
         ))}
-      </View>
+      </ScrollView>
+      <FreqEditModal
+        visible={editing !== null}
+        freq={editing !== null ? (bands[editing]?.freq ?? 1000) : 1000}
+        onClose={() => setEditing(null)}
+        onSubmit={hz => { if (editing !== null) onSetFreq(editing, hz); }}
+        onRemove={() => { if (editing !== null) onRemoveBand(editing); }}
+      />
     </View>
   );
 };
@@ -325,16 +381,16 @@ const eqS = StyleSheet.create({
   curveWrap: {position:'relative', overflow:'hidden', borderRadius:6, backgroundColor:'#ffffff08'},
   curveRow:  {flexDirection:'row', alignItems:'flex-end', height:'100%', opacity:0.55},
   zeroLine:  {position:'absolute', left:0, right:0, height:1, backgroundColor:'#ffffff22'},
-  bandsRow:  {flexDirection:'row', alignItems:'flex-end', marginTop:12},
-  scale:     {height:EQ_HEIGHT, justifyContent:'space-between', alignItems:'flex-end', marginBottom:18, marginRight:8, width:26},
+  bandsRow:  {flexDirection:'row', alignItems:'flex-end', marginTop:12, paddingRight:8},
+  scale:     {height:EQ_HEIGHT, justifyContent:'space-between', alignItems:'flex-end', marginBottom:20, marginRight:8, width:26},
   scaleTxt:  {fontSize:9, color:'#ffffff44'},
-  band:      {flex:1, alignItems:'center'},
+  bandCol:   {width:48, alignItems:'center'},
   gain:      {fontSize:11, fontWeight:'600', marginBottom:6},
   slider:    {width:'100%', alignItems:'center', position:'relative'},
   sliderTrack:{position:'absolute', top:0, bottom:0, width:2, marginLeft:-1, left:'50%', backgroundColor:'#ffffff1f', borderRadius:1},
   seg:       {position:'absolute', width:3, marginLeft:-1.5, left:'50%', borderRadius:2},
   knob:      {position:'absolute', left:'50%', marginLeft:-9, width:18, height:18, borderRadius:9, borderWidth:2, borderColor:'#000'},
-  freq:      {fontSize:9, color:'#888', marginTop:8},
+  freq:      {fontSize:10, fontWeight:'600', marginTop:8},
 });
 
 // ─── Helpers temps ────────────────────────────────────────────────────────────
@@ -346,9 +402,17 @@ function fmtTime(sec: number): string {
 }
 
 // ─── Player ───────────────────────────────────────────────────────────────────
-const PlayerScreen = ({track, onClose, queue, onRemoveFromQueue, eqInfo, eqLevels, onBandChange}: {
+const PlayerScreen = ({track, onClose, queue, onRemoveFromQueue, eq}: {
   track: Track; onClose: () => void; queue: Track[]; onRemoveFromQueue: (id: string) => void;
-  eqInfo: EqInfo | null; eqLevels: number[]; onBandChange: (band: number, mb: number) => void;
+  eq: {
+    range: {minDb: number; maxDb: number} | null;
+    bands: PeqBand[];
+    onGainLive: (i: number, db: number) => void;
+    onGainCommit: (i: number, db: number) => void;
+    onSetFreq: (i: number, hz: number) => void;
+    onAddBand: () => void;
+    onRemoveBand: (i: number) => void;
+  };
 }) => {
   const [sheetOpen, setSheetOpen] = useState(false);
   const [addOpen,   setAddOpen]   = useState(false);
@@ -498,18 +562,23 @@ const PlayerScreen = ({track, onClose, queue, onRemoveFromQueue, eqInfo, eqLevel
             <MaterialCommunityIcons name="equalizer-outline" size={14} color="#ffffff66"/>
             <Text style={pS.sectionTitle}>Égaliseur</Text>
             <View style={{flex:1}}/>
-            {eqInfo && (
-              <TouchableOpacity
-                onPress={() => Alert.alert(
-                  'Ajouter une fréquence',
-                  `L'égaliseur matériel de cet appareil a ${eqInfo.numberOfBands} bandes fixes (${eqInfo.bands.map(b => freqLabel(b.centerFreq)).join(', ')} Hz) et ne permet pas d'ajouter de fréquence. Un égaliseur paramétrique (fréquences libres) nécessiterait un moteur audio dédié.`,
-                )}>
-                <MaterialCommunityIcons name="plus-circle-outline" size={18} color="#ffffff88"/>
+            {eq.range && (
+              <TouchableOpacity onPress={eq.onAddBand} hitSlop={{top:8, bottom:8, left:8, right:8}}>
+                <MaterialCommunityIcons name="plus-circle-outline" size={20} color={palette.bright}/>
               </TouchableOpacity>
             )}
           </View>
-          {eqInfo ? (
-            <Equalizer info={eqInfo} levels={eqLevels} bright={palette.bright} onBandChange={onBandChange}/>
+          {eq.range ? (
+            <ParametricEq
+              bands={eq.bands}
+              minDb={eq.range.minDb}
+              maxDb={eq.range.maxDb}
+              bright={palette.bright}
+              onGainLive={eq.onGainLive}
+              onGainCommit={eq.onGainCommit}
+              onSetFreq={eq.onSetFreq}
+              onRemoveBand={eq.onRemoveBand}
+            />
           ) : (
             <Text style={[pS.timeText, {paddingVertical:12}]}>Égaliseur non disponible sur cet appareil.</Text>
           )}
@@ -1334,9 +1403,9 @@ export default function App() {
   const [theme,   setTheme]   = useState('Sombre');
   const [eq,      setEq]      = useState('Aucun');
   const [quality, setQuality] = useState('Haute fidélité');
-  // Égaliseur audio réel
-  const [eqInfo,   setEqInfo]   = useState<EqInfo | null>(null);
-  const [eqLevels, setEqLevels] = useState<number[]>([]);
+  // Égaliseur paramétrique (DynamicsProcessing) : fréquences + gains éditables
+  const [peqRange, setPeqRange] = useState<{minDb: number; maxDb: number} | null>(null);
+  const [eqBands,  setEqBands]  = useState<PeqBand[]>([]);
 
   // setter qui met à jour l'état ET enregistre sur disque
   const persist = useCallback(
@@ -1357,46 +1426,109 @@ export default function App() {
   useEffect(() => {
     (async () => {
       const stored = await AsyncStorage.getMany([
-        'pref.theme', 'pref.eq', 'pref.quality', 'pref.eqBands',
+        'pref.theme', 'pref.eq', 'pref.quality', 'pref.peqBands',
       ]);
       if (stored['pref.theme'])   setTheme(stored['pref.theme']!);
       if (stored['pref.eq'])      setEq(stored['pref.eq']!);
       if (stored['pref.quality']) setQuality(stored['pref.quality']!);
 
-      const info = await getEqInfo();
-      if (!info) return;             // pas d'égaliseur matériel dispo
-      setEqInfo(info);
+      const info = await peqGetInfo();
+      if (!info) return;             // EQ paramétrique indisponible
+      setPeqRange({minDb: info.minDb, maxDb: info.maxDb});
+
+      // Bandes : config persistée, sinon préréglage appliqué sur les fréquences par défaut.
+      let bands: PeqBand[] = info.bands.map(b => ({freq: b.freq, gain: b.gain}));
       const savedEq = stored['pref.eq'] ?? 'Aucun';
-      if (savedEq === 'Personnalisé' && stored['pref.eqBands']) {
-        const levels = JSON.parse(stored['pref.eqBands']) as number[];
-        await applyLevels(info, levels);
-        setEqLevels(levels);
-      } else {
-        setEqLevels(await applyPreset(savedEq, info));
+      if (stored['pref.peqBands']) {
+        try {
+          const parsed = JSON.parse(stored['pref.peqBands']) as PeqBand[];
+          if (parsed.length) bands = parsed;
+        } catch { /* config illisible → défaut */ }
+      } else if (savedEq !== 'Aucun' && savedEq !== 'Personnalisé') {
+        const gains = presetGainsFor(savedEq, bands.map(b => b.freq));
+        bands = bands.map((b, i) => ({freq: b.freq, gain: gains[i]}));
       }
+      peqConfigure(bands);
+      peqSetEnabled(true);
+      setEqBands(bands);
     })().catch(() => {});
   }, []);
 
-  // Sélection d'un préréglage depuis les Paramètres
-  const applyEqPreset = useCallback(async (name: string) => {
-    setEqPref(name);
-    if (!eqInfo || name === 'Personnalisé') return;
-    setEqLevels(await applyPreset(name, eqInfo));
-    AsyncStorage.removeItem('pref.eqBands').catch(() => {});
-  }, [eqInfo, setEqPref]);
+  const persistBands = (bands: PeqBand[]) =>
+    AsyncStorage.setItem('pref.peqBands', JSON.stringify(bands)).catch(() => {});
 
-  // Réglage d'une bande depuis le lecteur → passe en « Personnalisé »
-  const onBandChange = useCallback((band: number, mb: number) => {
-    setEqEnabled(true);
-    setBandLevel(band, mb);
-    setEqLevels(prev => {
-      const next = [...prev];
-      next[band] = mb;
-      AsyncStorage.setItem('pref.eqBands', JSON.stringify(next)).catch(() => {});
+  // Sélection d'un préréglage depuis les Paramètres (applique les gains aux freqs courantes)
+  const applyEqPreset = useCallback((name: string) => {
+    setEqPref(name);
+    if (name === 'Personnalisé') return;
+    setEqBands(prev => {
+      const gains = presetGainsFor(name, prev.map(b => b.freq));
+      const bands = prev.map((b, i) => ({freq: b.freq, gain: gains[i]}));
+      peqConfigure(bands);
+      persistBands(bands);
+      return bands;
+    });
+  }, [setEqPref]);
+
+  // Gain en temps réel pendant le glissement (audio uniquement, pas de state)
+  const onGainLive = useCallback((i: number, db: number) => { peqSetGain(i, db); }, []);
+
+  // Gain validé au relâcher → state + persistance + passe en « Personnalisé »
+  const onGainCommit = useCallback((i: number, db: number) => {
+    setEqBands(prev => {
+      const next = prev.map((b, idx) => (idx === i ? {...b, gain: db} : b));
+      persistBands(next);
       return next;
     });
-    if (eq !== 'Personnalisé') setEqPref('Personnalisé');
-  }, [eq, setEqPref]);
+    setEqPref('Personnalisé');
+  }, [setEqPref]);
+
+  // Édition d'une fréquence → reconfigure (le natif exige l'ordre croissant)
+  const onSetFreq = useCallback((i: number, hz: number) => {
+    setEqBands(prev => {
+      const next = prev.map((b, idx) => (idx === i ? {...b, freq: hz} : b)).sort((a, b) => a.freq - b.freq);
+      peqConfigure(next);
+      persistBands(next);
+      return next;
+    });
+    setEqPref('Personnalisé');
+  }, [setEqPref]);
+
+  // Ajoute une bande au plus grand écart (en log-fréquence), gain 0
+  const onAddBand = useCallback(() => {
+    setEqBands(prev => {
+      if (prev.length >= EQ_MAX_BANDS) return prev;
+      const sorted = [...prev].sort((a, b) => a.freq - b.freq);
+      let freq = 1000;
+      if (sorted.length >= 2) {
+        let bestGap = 0;
+        for (let k = 0; k < sorted.length - 1; k++) {
+          const gap = Math.log(sorted[k + 1].freq) - Math.log(sorted[k].freq);
+          if (gap > bestGap) {
+            bestGap = gap;
+            freq = Math.round(Math.exp((Math.log(sorted[k].freq) + Math.log(sorted[k + 1].freq)) / 2));
+          }
+        }
+      }
+      const next = [...sorted, {freq, gain: 0}].sort((a, b) => a.freq - b.freq);
+      peqConfigure(next);
+      persistBands(next);
+      return next;
+    });
+    setEqPref('Personnalisé');
+  }, [setEqPref]);
+
+  // Supprime une bande (garde au moins une)
+  const onRemoveBand = useCallback((i: number) => {
+    setEqBands(prev => {
+      if (prev.length <= 1) return prev;
+      const next = prev.filter((_, idx) => idx !== i);
+      peqConfigure(next);
+      persistBands(next);
+      return next;
+    });
+    setEqPref('Personnalisé');
+  }, [setEqPref]);
 
   const scan = useCallback(async () => {
     setScanState('scanning');
@@ -1510,9 +1642,7 @@ export default function App() {
           onClose={() => setPlayerOpen(false)}
           queue={tracks.slice(0, 30)}
           onRemoveFromQueue={() => {}}
-          eqInfo={eqInfo}
-          eqLevels={eqLevels}
-          onBandChange={onBandChange}
+          eq={{range: peqRange, bands: eqBands, onGainLive, onGainCommit, onSetFreq, onAddBand, onRemoveBand}}
         />
       )}
     </SafeAreaView>

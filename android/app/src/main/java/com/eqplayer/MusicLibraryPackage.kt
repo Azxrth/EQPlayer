@@ -7,7 +7,7 @@ import com.facebook.react.uimanager.ViewManager
 
 class MusicLibraryPackage : ReactPackage {
     override fun createNativeModules(reactContext: ReactApplicationContext): List<NativeModule> =
-        listOf(MusicLibraryModule(reactContext), EqualizerModule(reactContext))
+        listOf(MusicLibraryModule(reactContext), EqualizerModule(reactContext), ParametricEqModule(reactContext))
 
     override fun createViewManagers(reactContext: ReactApplicationContext): List<ViewManager<*, *>> =
         emptyList()
