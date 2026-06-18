@@ -27,6 +27,7 @@ import TrackPlayer from 'react-native-track-player';
 const {useActiveTrack} = require('react-native-track-player') as {useActiveTrack: () => import('react-native-track-player').Track | undefined};
 import {setupPlayer, usePlayer, toPlayerTrack} from './src/usePlayer';
 import {usePlaylists, createPlaylist, renamePlaylist, deletePlaylist, toggleTrack, removeTrack, type Playlist} from './src/usePlaylists';
+import {useFavorites, toggleFavorite} from './src/useFavorites';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import {getEqInfo, applyPreset, applyLevels, setBandLevel, setEnabled as setEqEnabled, freqLabel, type EqInfo} from './src/equalizer';
 
@@ -245,9 +246,9 @@ const PlayerScreen = ({track, onClose, queue, onRemoveFromQueue, eqInfo, eqLevel
   track: Track; onClose: () => void; queue: Track[]; onRemoveFromQueue: (id: string) => void;
   eqInfo: EqInfo | null; eqLevels: number[]; onBandChange: (band: number, mb: number) => void;
 }) => {
-  const [isFav,     setIsFav]     = useState(false);
   const [sheetOpen, setSheetOpen] = useState(false);
   const [addOpen,   setAddOpen]   = useState(false);
+  const favorites = useFavorites();
   // Position en cours de glissement (ratio 0..1), null quand on ne touche pas la barre.
   const [seekRatio, setSeekRatio] = useState<number | null>(null);
 
@@ -285,6 +286,8 @@ const PlayerScreen = ({track, onClose, queue, onRemoveFromQueue, eqInfo, eqLevel
   const palette = getPalette(displayTrack?.genre ?? track.genre);
   // L'objet track-player expose la pochette via `artwork` ; l'objet app via `artUri`.
   const coverUri = (displayTrack as any)?.artwork ?? (displayTrack as any)?.artUri ?? track.artUri;
+  const favId = (displayTrack as any)?.id ?? track.id;
+  const isFav = favId ? favorites.includes(favId) : false;
 
   // 'one' = répète le titre (boucle + « 1 ») ; 'loop-once'/'loop' = boucle simple
   // (le point sous l'icône distingue la répétition infinie) ; 'shuffle' = flèches croisées.
@@ -331,7 +334,7 @@ const PlayerScreen = ({track, onClose, queue, onRemoveFromQueue, eqInfo, eqLevel
             <Text style={[pS.trackArtist, {color:palette.bright+'cc'}]} numberOfLines={1}>{displayTrack?.artist ?? track.artist}</Text>
           </View>
           <View style={pS.titleActions}>
-            <TouchableOpacity onPress={() => setIsFav(f=>!f)} style={pS.titleBtn}>
+            <TouchableOpacity onPress={() => favId && toggleFavorite(favId)} style={pS.titleBtn}>
               <MaterialCommunityIcons name={isFav?'heart':'heart-outline'} size={22} color={isFav?'#ff4d6d':'#fff'}/>
             </TouchableOpacity>
             <TouchableOpacity style={pS.titleBtn} onPress={() => setAddOpen(true)}>
@@ -504,7 +507,7 @@ const pS = StyleSheet.create({
 });
 
 // ─── TrackRow (liste) ─────────────────────────────────────────────────────────
-const TrackRow = ({track, onPress, onDots, dotsIcon}: {track: any; onPress?: () => void; onDots?: () => void; dotsIcon?: string}) => {
+const TrackRow = ({track, onPress, onDots, dotsIcon, dotsColor}: {track: any; onPress?: () => void; onDots?: () => void; dotsIcon?: string; dotsColor?: string}) => {
   const {S} = useStyles();
   const c = useColors();
   return (
@@ -522,7 +525,7 @@ const TrackRow = ({track, onPress, onDots, dotsIcon}: {track: any; onPress?: () 
     </View>
     {track.format ? <Text style={S.rowFormat}>{track.format}</Text> : null}
     <TouchableOpacity style={S.rowDots} onPress={onDots}>
-      <MaterialCommunityIcons name={(dotsIcon ?? 'dots-vertical') as any} size={18} color={c.iconDim}/>
+      <MaterialCommunityIcons name={(dotsIcon ?? 'dots-vertical') as any} size={18} color={dotsColor ?? c.iconDim}/>
     </TouchableOpacity>
   </TouchableOpacity>
   );
@@ -1011,9 +1014,34 @@ const FavoritesPage = ({tracks, onTrackPress}: {tracks: Track[]; onTrackPress: (
   const [view, setView] = useState<ViewMode>('list');
   const {S} = useStyles();
   const c = useColors();
+  const favorites = useFavorites();
 
   const renderContent = () => {
     if (activeTab === 1) return <PlaylistsTab tracks={tracks} onTrackPress={onTrackPress}/>;
+
+    // Onglet Favoris : on filtre la bibliothèque sur les ids favoris (ordre de favori).
+    if (activeTab === 0) {
+      const favTracks = favorites
+        .map(id => tracks.find(t => t.id === id))
+        .filter(Boolean) as Track[];
+      if (favTracks.length === 0) {
+        return <EmptyState msg="Aucun favori" sub="Touche le ♥ dans le lecteur pour ajouter un morceau"/>;
+      }
+      return (
+        <>
+          <Toolbar count={favTracks.length} label="pistes" view={view} onView={setView}/>
+          {view === 'grid'
+            ? <TrackGrid tracks={favTracks} onPress={onTrackPress}/>
+            : <FlatList data={favTracks} keyExtractor={i=>i.id}
+                renderItem={({item}) => (
+                  <TrackRow track={item} onPress={() => onTrackPress(item)}
+                    onDots={() => toggleFavorite(item.id)} dotsIcon="heart" dotsColor="#ff4d6d"/>
+                )}/>
+          }
+        </>
+      );
+    }
+
     const list = activeTab === 4 ? [...tracks].reverse() : tracks;
     return (
       <>
