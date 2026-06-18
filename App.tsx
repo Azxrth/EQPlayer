@@ -196,6 +196,7 @@ const GRID_COLS   = 3;
 const GRID_PAD    = 12;   // padding extérieur
 const GRID_GAP    = 6;    // espace entre items
 const GRID_ITEM_W = (width - GRID_PAD * 2 - GRID_GAP * (GRID_COLS - 1)) / GRID_COLS;
+const ROW_H = 67; // hauteur fixe d'une ligne TrackRow (pour getItemLayout / scrollToIndex)
 
 // ─── Égaliseur tactile ────────────────────────────────────────────────────────
 const EQ_HEIGHT = 130;     // hauteur des sliders
@@ -857,6 +858,95 @@ const makeGS = (c: Colors) => StyleSheet.create({
   badgeText:{fontSize:8, color:'#ffffff88', fontWeight:'600'},
 });
 
+// ─── Liste avec index alphabétique A-Z sur le côté ────────────────────────────
+const ALPHA = ['#','A','B','C','D','E','F','G','H','I','J','K','L','M','N','O','P','Q','R','S','T','U','V','W','X','Y','Z'];
+const letterOf = (s: string) => {
+  const ch = (s ?? '').trim().charAt(0).toUpperCase();
+  return ch >= 'A' && ch <= 'Z' ? ch : '#';
+};
+
+const IndexedList = ({data, getName, renderItem, keyExtractor}: {
+  data: any[]; getName: (item: any) => string;
+  renderItem: (info: {item: any}) => React.ReactElement; keyExtractor: (item: any) => string;
+}) => {
+  const c = useColors();
+  const listRef = useRef<FlatList<any>>(null);
+  const [barH, setBarH] = useState(0);
+  const lastLetter = useRef('');
+
+  // Première occurrence de chaque lettre dans la liste (supposée triée).
+  const getNameRef = useRef(getName); getNameRef.current = getName;
+  const letterIndex = useMemo(() => {
+    const m = new Map<string, number>();
+    data.forEach((item, i) => {
+      const L = letterOf(getNameRef.current(item));
+      if (!m.has(L)) m.set(L, i);
+    });
+    return m;
+  }, [data]); // ne dépend que des données (getName est stable par liste)
+
+  const jumpTo = useCallback((letter: string) => {
+    let idx = letterIndex.get(letter);
+    if (idx === undefined) {
+      // lettre absente → on prend la plus proche disponible
+      const pos = ALPHA.indexOf(letter);
+      for (let k = pos; k < ALPHA.length && idx === undefined; k++) idx = letterIndex.get(ALPHA[k]);
+      for (let k = pos; k >= 0 && idx === undefined; k--) idx = letterIndex.get(ALPHA[k]);
+    }
+    if (idx !== undefined) listRef.current?.scrollToIndex({index: idx, animated: false});
+  }, [letterIndex]);
+
+  // Glissement sur la barre : on saute à la lettre sous le doigt (via un ref pour
+  // que le PanResponder, créé une fois, lise toujours barH/jumpTo à jour).
+  const onTouchRef = useRef<(y: number) => void>(() => {});
+  onTouchRef.current = (y: number) => {
+    if (barH <= 0) return;
+    const i = Math.max(0, Math.min(ALPHA.length - 1, Math.floor(y / (barH / ALPHA.length))));
+    const L = ALPHA[i];
+    if (L !== lastLetter.current) { lastLetter.current = L; jumpTo(L); }
+  };
+  const pan = useRef(
+    PanResponder.create({
+      onStartShouldSetPanResponder: () => true,
+      onMoveShouldSetPanResponder: () => true,
+      onPanResponderGrant: e => onTouchRef.current(e.nativeEvent.locationY),
+      onPanResponderMove:  e => onTouchRef.current(e.nativeEvent.locationY),
+      onPanResponderRelease: () => { lastLetter.current = ''; },
+      onPanResponderTerminate: () => { lastLetter.current = ''; },
+    }),
+  ).current;
+
+  return (
+    <View style={alphaS.wrap}>
+      <FlatList
+        ref={listRef}
+        style={alphaS.list}
+        data={data}
+        renderItem={renderItem}
+        keyExtractor={keyExtractor}
+        initialNumToRender={14}
+        maxToRenderPerBatch={12}
+        windowSize={7}
+        removeClippedSubviews
+        getItemLayout={(_, i) => ({length: ROW_H, offset: ROW_H * i, index: i})}
+        onScrollToIndexFailed={() => {}}
+      />
+      <View style={alphaS.bar} onLayout={e => setBarH(e.nativeEvent.layout.height)} {...pan.panHandlers}>
+        {ALPHA.map(L => (
+          <Text key={L} style={[alphaS.letter, {color: c.textDim}]}>{L}</Text>
+        ))}
+      </View>
+    </View>
+  );
+};
+
+const alphaS = StyleSheet.create({
+  wrap:   {flex:1, flexDirection:'row'},
+  list:   {flex:1},
+  bar:    {width:22, justifyContent:'center', alignItems:'center', paddingVertical:8},
+  letter: {fontSize:10, fontWeight:'600', lineHeight:13.5, textAlign:'center'},
+});
+
 // ─── Toolbar ──────────────────────────────────────────────────────────────────
 const Toolbar = ({count, label, view, onView, onPlayAll}: {
   count: number; label: string; view: ViewMode; onView: (v: ViewMode) => void; onPlayAll?: () => void;
@@ -948,7 +1038,7 @@ const LibraryPage = ({tracks, onTrackPress, navIntent, onNavConsumed}: {
       <Toolbar count={items.length} label={label} view={view} onView={setView}/>
       {view === 'grid'
         ? <CategoryGrid items={items} icon={icon} onOpen={it => openCategory(it as CatItem)}/>
-        : <FlatList data={items} keyExtractor={i=>i.id} initialNumToRender={20}
+        : <IndexedList data={items} getName={(it: CatItem) => it.name} keyExtractor={(i: CatItem) => i.id}
             renderItem={({item}) => (
               <TrackRow
                 track={{title:item.name, artist:item.sub, artUri:item.artUri, format:'', genre:'', year:''}}
@@ -987,13 +1077,10 @@ const LibraryPage = ({tracks, onTrackPress, navIntent, onNavConsumed}: {
           onPlayAll={() => tracks.length && onTrackPress(tracks[0], tracks)}/>
         {view === 'grid'
           ? <TrackGrid tracks={tracks} onPress={t => onTrackPress(t, tracks)}/>
-          : <FlatList
+          : <IndexedList
               data={tracks}
-              keyExtractor={i=>i.id}
-              initialNumToRender={14}
-              maxToRenderPerBatch={12}
-              windowSize={7}
-              removeClippedSubviews
+              getName={t => t.title}
+              keyExtractor={i => i.id}
               renderItem={({item}) => <TrackRow track={item} onPress={() => onTrackPress(item, tracks)}/>}
             />
         }
@@ -2036,7 +2123,7 @@ const makeS = (c: Colors) => StyleSheet.create({
   tbBtnAct:     {backgroundColor:c.surface2},
   tbDivider:    {width:0.5, height:16, backgroundColor:c.border, marginHorizontal:4},
 
-  row:       {flexDirection:'row', alignItems:'center', gap:10, paddingHorizontal:16, paddingVertical:10, borderBottomWidth:0.5, borderBottomColor:c.border},
+  row:       {flexDirection:'row', alignItems:'center', gap:10, paddingHorizontal:16, height:ROW_H, borderBottomWidth:0.5, borderBottomColor:c.border},
   rowCover:  {width:46, height:46, borderRadius:6, alignItems:'center', justifyContent:'center'},
   rowMeta:   {flex:1, minWidth:0},
   rowTitle:  {fontSize:13, fontWeight:'500', color:c.text},
