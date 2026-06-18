@@ -141,7 +141,25 @@ type Track = {
   format:   string;
   genre:    string;
   mime?:    string;
+  sampleRate?: number;  // Hz (0 si inconnu)
+  bitDepth?:   number;  // bits (0 si inconnu)
 };
+
+// Regroupe un morceau par qualité audio (taux d'échantillonnage, ou DSDxxx).
+// `rate` sert au tri : PCM par fréquence croissante, DSD après, inconnu en dernier.
+function qualityGroup(t: Track): {key: string; label: string; rate: number} {
+  const isDsd = t.format === 'DSD' || (t.mime?.includes('dsd') ?? false);
+  if (isDsd) {
+    const mult = t.sampleRate && t.sampleRate > 0 ? Math.round(t.sampleRate / 44100) : 0;
+    const label = mult >= 32 ? `DSD${mult}` : 'DSD';
+    return {key: label, label, rate: 10_000_000 + (t.sampleRate ?? 0)};
+  }
+  const sr = t.sampleRate ?? 0;
+  if (sr <= 0) return {key: 'unknown', label: 'Inconnu', rate: Number.MAX_SAFE_INTEGER};
+  const khz = sr / 1000;
+  const label = (Number.isInteger(khz) ? khz.toString() : khz.toFixed(1)) + 'kHz';
+  return {key: label, label, rate: sr};
+}
 
 // ─── Données démo (affichées avant le premier scan) ──────────────────────────
 const DEMO_TRACKS: Track[] = [
@@ -765,12 +783,27 @@ const LibraryPage = ({tracks, onTrackPress}: {tracks: Track[]; onTrackPress: (t:
         </>
       );
     }
-    // Sampling — non disponible depuis MediaStore pour l'instant
+    // Sampling — regroupement par qualité audio (taux d'échantillonnage / DSD)
     if (activeTab === 6) {
+      const groups = new Map<string, {label: string; rate: number; count: number}>();
+      tracks.forEach(t => {
+        const g = qualityGroup(t);
+        const ex = groups.get(g.key);
+        if (ex) ex.count++;
+        else groups.set(g.key, {label: g.label, rate: g.rate, count: 1});
+      });
+      const items = [...groups.values()]
+        .sort((a, b) => a.rate - b.rate)
+        .map(g => ({name: g.label, sub: g.count + ' pistes', id: g.label}));
       return (
         <>
-          <Toolbar count={0} label="taux" view={view} onView={setView}/>
-          <EmptyState msg="Sampling rate" sub="Non disponible via MediaStore"/>
+          <Toolbar count={items.length} label="qualites" view={view} onView={setView}/>
+          {items.length === 0
+            ? <EmptyState msg="Qualité audio" sub="Aucune info de taux d'échantillonnage"/>
+            : view === 'grid'
+              ? <CategoryGrid items={items} icon="sine-wave"/>
+              : <FlatList data={items} keyExtractor={i=>i.id} renderItem={({item}) => <TrackRow track={{title:item.name, artist:item.sub, format:'', genre:'', year:''}}/>}/>
+          }
         </>
       );
     }

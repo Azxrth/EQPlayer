@@ -1,15 +1,29 @@
 package com.eqplayer
 
 import android.content.ContentUris
+import android.media.MediaExtractor
+import android.media.MediaFormat
 import android.net.Uri
 import android.os.Build
 import android.provider.MediaStore
 import com.facebook.react.bridge.*
+import java.util.concurrent.Executors
 
 class MusicLibraryModule(reactContext: ReactApplicationContext) :
     ReactContextBaseJavaModule(reactContext) {
 
     override fun getName() = "MusicLibrary"
+
+    // Holder intermédiaire : on collecte les lignes du curseur puis on remplit
+    // sampleRate/bitDepth en parallèle avant de construire le tableau JS.
+    private class Row(
+        val id: String, val title: String, val artist: String, val album: String,
+        val albumId: String, val artUri: String, val duration: Double, val filePath: String,
+        val year: String, val format: String, val genre: String, val mime: String,
+    ) {
+        var sampleRate = 0
+        var bitDepth = 0
+    }
 
     @ReactMethod
     fun getTracks(promise: Promise) {
@@ -35,6 +49,9 @@ class MusicLibraryModule(reactContext: ReactApplicationContext) :
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                         add(MediaStore.Audio.Media.GENRE)
                     }
+                    // NB : SAMPLERATE/BITS_PER_SAMPLE (colonnes API 31) ne sont pas
+                    // exposées par toutes les ROMs (ex. FiiO) et font planter la
+                    // requête → on lit le taux par fichier via MediaExtractor plus bas.
                 }.toTypedArray()
 
                 val selection = "${MediaStore.Audio.Media.IS_MUSIC} != 0 AND ${MediaStore.Audio.Media.DURATION} > 10000"
@@ -53,6 +70,7 @@ class MusicLibraryModule(reactContext: ReactApplicationContext) :
                     buildGenreMap()
                 } else emptyMap()
 
+                val rows = ArrayList<Row>()
                 cursor?.use {
                     val idCol         = it.getColumnIndexOrThrow(MediaStore.Audio.Media._ID)
                     val titleCol      = it.getColumnIndexOrThrow(MediaStore.Audio.Media.TITLE)
@@ -81,8 +99,13 @@ class MusicLibraryModule(reactContext: ReactApplicationContext) :
                             ).toString()
                         }
 
-                        val mime   = it.getString(mimeCol) ?: ""
-                        val format = mimeToFormat(mime)
+                        val mime     = it.getString(mimeCol) ?: ""
+                        val filePath = it.getString(dataCol) ?: ""
+                        // DSD : MediaStore renvoie souvent un mime générique → on
+                        // retombe sur l'extension du fichier.
+                        val isDsd  = mime.contains("dsd") || mime.contains("dsf") ||
+                                     filePath.endsWith(".dsf", true) || filePath.endsWith(".dff", true)
+                        val format = if (isDsd) "DSD" else mimeToFormat(mime)
 
                         val genre = when {
                             genreColIdx >= 0 -> it.getString(genreColIdx) ?: ""
@@ -91,22 +114,55 @@ class MusicLibraryModule(reactContext: ReactApplicationContext) :
 
                         val year = it.getInt(yearCol).let { y -> if (y > 0) y.toString() else "" }
 
-                        val track = WritableNativeMap().apply {
-                            putString("id",       id.toString())
-                            putString("title",    it.getString(titleCol)?.trim() ?: "Titre inconnu")
-                            putString("artist",   sanitizeUnknown(it.getString(artistCol)))
-                            putString("album",    sanitizeUnknown(it.getString(albumCol)))
-                            putString("albumId",  albumId.toString())
-                            putString("artUri",   artUri)
-                            putDouble("duration", it.getLong(durationCol).toDouble())
-                            putString("filePath", it.getString(dataCol) ?: "")
-                            putString("year",     year)
-                            putString("format",   format)
-                            putString("genre",    genre)
-                            putString("mime",     mime)
-                        }
-                        tracks.pushMap(track)
+                        rows.add(Row(
+                            id = id.toString(),
+                            title = it.getString(titleCol)?.trim() ?: "Titre inconnu",
+                            artist = sanitizeUnknown(it.getString(artistCol)),
+                            album = sanitizeUnknown(it.getString(albumCol)),
+                            albumId = albumId.toString(),
+                            artUri = artUri,
+                            duration = it.getLong(durationCol).toDouble(),
+                            filePath = filePath,
+                            year = year,
+                            format = format,
+                            genre = genre,
+                            mime = mime,
+                        ))
                     }
+                }
+
+                // Lecture parallèle des en-têtes (I/O bound) : indispensable pour
+                // ne pas bloquer ~30 s à scanner des milliers de fichiers en série.
+                val pool = Executors.newFixedThreadPool(8)
+                try {
+                    rows.map { row ->
+                        pool.submit {
+                            val (sr, bd) = readAudioFormat(row.filePath)
+                            row.sampleRate = sr
+                            row.bitDepth = bd
+                        }
+                    }.forEach { it.get() }
+                } finally {
+                    pool.shutdown()
+                }
+
+                for (row in rows) {
+                    tracks.pushMap(WritableNativeMap().apply {
+                        putString("id",       row.id)
+                        putString("title",    row.title)
+                        putString("artist",   row.artist)
+                        putString("album",    row.album)
+                        putString("albumId",  row.albumId)
+                        putString("artUri",   row.artUri)
+                        putDouble("duration", row.duration)
+                        putString("filePath", row.filePath)
+                        putString("year",     row.year)
+                        putString("format",   row.format)
+                        putString("genre",    row.genre)
+                        putString("mime",     row.mime)
+                        putInt("sampleRate",  row.sampleRate)
+                        putInt("bitDepth",    row.bitDepth)
+                    })
                 }
 
                 promise.resolve(tracks)
@@ -148,6 +204,42 @@ class MusicLibraryModule(reactContext: ReactApplicationContext) :
             }
         } catch (_: Exception) {}
         return map
+    }
+
+    // Lit (sampleRate Hz, bitDepth bits) depuis l'en-tête du fichier audio.
+    // MediaExtractor ne décode pas : il ne parse que le format → rapide.
+    // Best-effort : renvoie (0, 0) si illisible (ex. DSD non supporté).
+    private fun readAudioFormat(path: String): Pair<Int, Int> {
+        if (path.isEmpty()) return 0 to 0
+        val extractor = MediaExtractor()
+        try {
+            extractor.setDataSource(path)
+            for (i in 0 until extractor.trackCount) {
+                val fmt = extractor.getTrackFormat(i)
+                val mime = fmt.getString(MediaFormat.KEY_MIME) ?: continue
+                if (!mime.startsWith("audio/")) continue
+                val sampleRate = if (fmt.containsKey(MediaFormat.KEY_SAMPLE_RATE))
+                    fmt.getInteger(MediaFormat.KEY_SAMPLE_RATE) else 0
+                // Pas de clé standard pour la profondeur ; certaines pistes l'exposent.
+                val bitDepth = when {
+                    fmt.containsKey("bits-per-sample") -> fmt.getInteger("bits-per-sample")
+                    fmt.containsKey(MediaFormat.KEY_PCM_ENCODING) -> when (fmt.getInteger(MediaFormat.KEY_PCM_ENCODING)) {
+                        2 -> 16  // ENCODING_PCM_16BIT
+                        3 -> 8   // ENCODING_PCM_8BIT
+                        4 -> 32  // ENCODING_PCM_FLOAT
+                        0x15000001 -> 32 // ENCODING_PCM_24BIT_PACKED → reporté 24 plus bas
+                        else -> 0
+                    }
+                    else -> 0
+                }
+                return sampleRate to bitDepth
+            }
+        } catch (_: Exception) {
+            // fichier illisible par MediaExtractor (DSD, corrompu…) → 0/0
+        } finally {
+            extractor.release()
+        }
+        return 0 to 0
     }
 
     private fun mimeToFormat(mime: String) = when {
