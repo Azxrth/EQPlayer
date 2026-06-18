@@ -4,6 +4,7 @@ import {
   Text,
   StyleSheet,
   TouchableOpacity,
+  TextInput,
   ScrollView,
   FlatList,
   StatusBar,
@@ -25,6 +26,7 @@ import TrackPlayer from 'react-native-track-player';
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const {useActiveTrack} = require('react-native-track-player') as {useActiveTrack: () => import('react-native-track-player').Track | undefined};
 import {setupPlayer, usePlayer, toPlayerTrack} from './src/usePlayer';
+import {usePlaylists, createPlaylist, renamePlaylist, deletePlaylist, toggleTrack, removeTrack, type Playlist} from './src/usePlaylists';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import {getEqInfo, applyPreset, applyLevels, setBandLevel, setEnabled as setEqEnabled, freqLabel, type EqInfo} from './src/equalizer';
 
@@ -245,6 +247,7 @@ const PlayerScreen = ({track, onClose, queue, onRemoveFromQueue, eqInfo, eqLevel
 }) => {
   const [isFav,     setIsFav]     = useState(false);
   const [sheetOpen, setSheetOpen] = useState(false);
+  const [addOpen,   setAddOpen]   = useState(false);
   // Position en cours de glissement (ratio 0..1), null quand on ne touche pas la barre.
   const [seekRatio, setSeekRatio] = useState<number | null>(null);
 
@@ -331,7 +334,7 @@ const PlayerScreen = ({track, onClose, queue, onRemoveFromQueue, eqInfo, eqLevel
             <TouchableOpacity onPress={() => setIsFav(f=>!f)} style={pS.titleBtn}>
               <MaterialCommunityIcons name={isFav?'heart':'heart-outline'} size={22} color={isFav?'#ff4d6d':'#fff'}/>
             </TouchableOpacity>
-            <TouchableOpacity style={pS.titleBtn}>
+            <TouchableOpacity style={pS.titleBtn} onPress={() => setAddOpen(true)}>
               <MaterialCommunityIcons name="plus" size={22} color="#fff"/>
             </TouchableOpacity>
           </View>
@@ -447,6 +450,11 @@ const PlayerScreen = ({track, onClose, queue, onRemoveFromQueue, eqInfo, eqLevel
           </View>
         </TouchableOpacity>
       )}
+
+      <AddToPlaylistSheet
+        trackId={(displayTrack as any)?.id ?? null}
+        visible={addOpen}
+        onClose={() => setAddOpen(false)}/>
     </View>
   );
 };
@@ -496,7 +504,7 @@ const pS = StyleSheet.create({
 });
 
 // ─── TrackRow (liste) ─────────────────────────────────────────────────────────
-const TrackRow = ({track, onPress}: {track: any; onPress?: () => void}) => {
+const TrackRow = ({track, onPress, onDots, dotsIcon}: {track: any; onPress?: () => void; onDots?: () => void; dotsIcon?: string}) => {
   const {S} = useStyles();
   const c = useColors();
   return (
@@ -513,8 +521,8 @@ const TrackRow = ({track, onPress}: {track: any; onPress?: () => void}) => {
       <Text style={S.rowSub}   numberOfLines={1}>{track.artist}</Text>
     </View>
     {track.format ? <Text style={S.rowFormat}>{track.format}</Text> : null}
-    <TouchableOpacity style={S.rowDots}>
-      <MaterialCommunityIcons name="dots-vertical" size={18} color={c.iconDim}/>
+    <TouchableOpacity style={S.rowDots} onPress={onDots}>
+      <MaterialCommunityIcons name={(dotsIcon ?? 'dots-vertical') as any} size={18} color={c.iconDim}/>
     </TouchableOpacity>
   </TouchableOpacity>
   );
@@ -803,6 +811,200 @@ const LibraryPage = ({tracks, onTrackPress}: {tracks: Track[]; onTrackPress: (t:
   );
 };
 
+// ─── Playlists ────────────────────────────────────────────────────────────────
+// Modale centrée pour saisir/éditer un nom (Alert.prompt est iOS-only).
+const NameModal = ({visible, title, initial, onSubmit, onClose}: {
+  visible: boolean; title: string; initial?: string;
+  onSubmit: (name: string) => void; onClose: () => void;
+}) => {
+  const {setS} = useStyles();
+  const c = useColors();
+  const [name, setName] = useState(initial ?? '');
+  useEffect(() => { if (visible) setName(initial ?? ''); }, [visible, initial]);
+  const submit = () => { const n = name.trim(); if (n) onSubmit(n); onClose(); };
+  return (
+    <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
+      <TouchableOpacity style={setS.centerBackdrop} activeOpacity={1} onPress={onClose}>
+        <TouchableOpacity style={setS.dialog} activeOpacity={1}>
+          <Text style={setS.dialogTitle}>{title}</Text>
+          <TextInput
+            style={setS.input}
+            value={name}
+            onChangeText={setName}
+            placeholder="Nom de la playlist"
+            placeholderTextColor={c.iconDim}
+            autoFocus
+            returnKeyType="done"
+            onSubmitEditing={submit}
+          />
+          <View style={setS.dialogActions}>
+            <TouchableOpacity style={setS.dialogBtn} onPress={onClose}>
+              <Text style={setS.dialogBtnText}>Annuler</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={setS.dialogBtn} onPress={submit}>
+              <Text style={setS.dialogBtnPrimary}>OK</Text>
+            </TouchableOpacity>
+          </View>
+        </TouchableOpacity>
+      </TouchableOpacity>
+    </Modal>
+  );
+};
+
+// Bottom sheet « Ajouter à une playlist » (depuis le lecteur).
+const AddToPlaylistSheet = ({trackId, visible, onClose}: {trackId: string | null; visible: boolean; onClose: () => void}) => {
+  const {setS} = useStyles();
+  const c = useColors();
+  const playlists = usePlaylists();
+  const [naming, setNaming] = useState(false);
+  const [name, setName] = useState('');
+
+  const createAndAdd = () => {
+    const n = name.trim();
+    if (!n) return;
+    const pl = createPlaylist(n);
+    if (trackId) toggleTrack(pl.id, trackId);
+    setName(''); setNaming(false);
+  };
+
+  return (
+    <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
+      <TouchableOpacity style={setS.backdrop} activeOpacity={1} onPress={onClose}>
+        <TouchableOpacity style={setS.sheet} activeOpacity={1}>
+          <Text style={setS.sheetTitle}>Ajouter à une playlist</Text>
+          <ScrollView style={setS.sheetList}>
+            {playlists.length === 0 && (
+              <Text style={setS.emptyHint}>Aucune playlist pour l'instant.</Text>
+            )}
+            {playlists.map(pl => {
+              const inIt = trackId ? pl.trackIds.includes(trackId) : false;
+              return (
+                <TouchableOpacity key={pl.id} style={setS.option}
+                  onPress={() => { if (trackId) toggleTrack(pl.id, trackId); }}>
+                  <View style={setS.optionMeta}>
+                    <Text style={setS.optionText}>{pl.name}</Text>
+                    <Text style={setS.optionSub}>{pl.trackIds.length} morceaux</Text>
+                  </View>
+                  <MaterialCommunityIcons
+                    name={inIt ? 'check-circle' : 'plus-circle-outline'}
+                    size={22} color={inIt ? c.accent : c.iconDim}/>
+                </TouchableOpacity>
+              );
+            })}
+          </ScrollView>
+          {naming ? (
+            <View style={setS.newRow}>
+              <TextInput
+                style={setS.inputInline}
+                value={name}
+                onChangeText={setName}
+                placeholder="Nom de la playlist"
+                placeholderTextColor={c.iconDim}
+                autoFocus
+                returnKeyType="done"
+                onSubmitEditing={createAndAdd}/>
+              <TouchableOpacity onPress={createAndAdd}>
+                <Text style={setS.dialogBtnPrimary}>Créer</Text>
+              </TouchableOpacity>
+            </View>
+          ) : (
+            <TouchableOpacity style={setS.newRow} onPress={() => setNaming(true)}>
+              <MaterialCommunityIcons name="playlist-plus" size={22} color={c.accent}/>
+              <Text style={[setS.optionText, setS.newText]}>Nouvelle playlist</Text>
+            </TouchableOpacity>
+          )}
+        </TouchableOpacity>
+      </TouchableOpacity>
+    </Modal>
+  );
+};
+
+// Onglet Playlists : liste des playlists + vue détail d'une playlist.
+const PlaylistsTab = ({tracks, onTrackPress}: {tracks: Track[]; onTrackPress: (t: Track) => void}) => {
+  const {S} = useStyles();
+  const c = useColors();
+  const playlists = usePlaylists();
+  const [openId, setOpenId] = useState<string | null>(null);
+  const [naming, setNaming] = useState<{mode: 'create'} | {mode: 'rename'; id: string; current: string} | null>(null);
+
+  const opened = playlists.find(p => p.id === openId) ?? null;
+
+  const confirmDelete = (pl: Playlist) =>
+    Alert.alert('Supprimer la playlist', `Supprimer « ${pl.name} » ?`, [
+      {text: 'Annuler', style: 'cancel'},
+      {text: 'Supprimer', style: 'destructive', onPress: () => deletePlaylist(pl.id)},
+    ]);
+
+  // Vue détail d'une playlist
+  if (opened) {
+    const items = opened.trackIds
+      .map(id => tracks.find(t => t.id === id))
+      .filter(Boolean) as Track[];
+    return (
+      <View style={S.content}>
+        <View style={S.plDetailHeader}>
+          <TouchableOpacity onPress={() => setOpenId(null)} style={S.headerBtn}>
+            <MaterialCommunityIcons name="chevron-left" size={26} color={c.text}/>
+          </TouchableOpacity>
+          <Text style={S.plDetailTitle} numberOfLines={1}>{opened.name}</Text>
+          <TouchableOpacity onPress={() => setNaming({mode: 'rename', id: opened.id, current: opened.name})} style={S.headerBtn}>
+            <MaterialCommunityIcons name="pencil-outline" size={20} color={c.textDim}/>
+          </TouchableOpacity>
+        </View>
+        {items.length === 0
+          ? <EmptyState msg="Playlist vide" sub="Ajoute des morceaux depuis le lecteur (bouton +)"/>
+          : <FlatList
+              data={items}
+              keyExtractor={i => i.id}
+              renderItem={({item}) => (
+                <TrackRow track={item} onPress={() => onTrackPress(item)}
+                  onDots={() => removeTrack(opened.id, item.id)} dotsIcon="minus-circle-outline"/>
+              )}/>
+        }
+        <NameModal
+          visible={naming?.mode === 'rename'}
+          title="Renommer la playlist"
+          initial={naming?.mode === 'rename' ? naming.current : ''}
+          onClose={() => setNaming(null)}
+          onSubmit={n => { if (naming?.mode === 'rename') renamePlaylist(naming.id, n); }}/>
+      </View>
+    );
+  }
+
+  // Liste des playlists
+  return (
+    <View style={S.content}>
+      <TouchableOpacity style={S.plNewBtn} onPress={() => setNaming({mode: 'create'})}>
+        <MaterialCommunityIcons name="playlist-plus" size={22} color={c.accent}/>
+        <Text style={S.plNewText}>Nouvelle playlist</Text>
+      </TouchableOpacity>
+      {playlists.length === 0
+        ? <EmptyState msg="Aucune playlist" sub="Crée ta première playlist ci-dessus"/>
+        : <FlatList
+            data={playlists}
+            keyExtractor={i => i.id}
+            renderItem={({item}) => (
+              <TouchableOpacity style={S.plRow} activeOpacity={0.7} onPress={() => setOpenId(item.id)}>
+                <View style={S.plIcon}><MaterialCommunityIcons name="playlist-music" size={22} color={c.icon}/></View>
+                <View style={S.rowMeta}>
+                  <Text style={S.rowTitle} numberOfLines={1}>{item.name}</Text>
+                  <Text style={S.rowSub}>{item.trackIds.length} morceaux</Text>
+                </View>
+                <TouchableOpacity style={S.rowDots} onPress={() => confirmDelete(item)}>
+                  <MaterialCommunityIcons name="trash-can-outline" size={18} color={c.iconDim}/>
+                </TouchableOpacity>
+              </TouchableOpacity>
+            )}/>
+      }
+      <NameModal
+        visible={naming?.mode === 'create'}
+        title="Nouvelle playlist"
+        onClose={() => setNaming(null)}
+        onSubmit={n => createPlaylist(n)}/>
+    </View>
+  );
+};
+
 // ─── Favorites Page ───────────────────────────────────────────────────────────
 const FavoritesPage = ({tracks, onTrackPress}: {tracks: Track[]; onTrackPress: (t: Track) => void}) => {
   const [activeTab, setActiveTab] = useState(0);
@@ -811,7 +1013,7 @@ const FavoritesPage = ({tracks, onTrackPress}: {tracks: Track[]; onTrackPress: (
   const c = useColors();
 
   const renderContent = () => {
-    if (activeTab === 1) return <EmptyState msg="Aucune playlist" sub="Crée ta première playlist depuis un morceau"/>;
+    if (activeTab === 1) return <PlaylistsTab tracks={tracks} onTrackPress={onTrackPress}/>;
     const list = activeTab === 4 ? [...tracks].reverse() : tracks;
     return (
       <>
@@ -926,6 +1128,25 @@ const makeSetS = (c: Colors) => StyleSheet.create({
   option:     {flexDirection:'row', alignItems:'center', justifyContent:'space-between', paddingVertical:16, paddingHorizontal:20},
   optionText: {color:c.text, fontSize:16},
   optionTextActive: {color:c.accent, fontWeight:'600'},
+
+  // Playlists — sheet « Ajouter à une playlist »
+  sheetList:  {maxHeight:320},
+  optionMeta: {flex:1},
+  optionSub:  {color:c.iconDim, fontSize:12, marginTop:2},
+  emptyHint:  {color:c.iconDim, fontSize:14, textAlign:'center', paddingVertical:20},
+  newRow:     {flexDirection:'row', alignItems:'center', gap:12, paddingVertical:16, paddingHorizontal:20, borderTopWidth:0.5, borderTopColor:c.border},
+  newText:    {color:c.accent},
+  inputInline:{flex:1, color:c.text, fontSize:16, paddingVertical:4},
+
+  // Playlists — modale centrée de nommage
+  centerBackdrop: {flex:1, backgroundColor:'#000000aa', justifyContent:'center', alignItems:'center', padding:32},
+  dialog:         {width:'100%', backgroundColor:c.surface, borderRadius:14, padding:18},
+  dialogTitle:    {color:c.text, fontSize:16, fontWeight:'600', marginBottom:14},
+  input:          {color:c.text, fontSize:16, borderBottomWidth:1, borderBottomColor:c.border, paddingVertical:8},
+  dialogActions:  {flexDirection:'row', justifyContent:'flex-end', gap:8, marginTop:18},
+  dialogBtn:      {paddingVertical:8, paddingHorizontal:16},
+  dialogBtnText:  {color:c.textDim, fontSize:15},
+  dialogBtnPrimary: {color:c.accent, fontSize:15, fontWeight:'600'},
 });
 
 // ─── Mini Player ──────────────────────────────────────────────────────────────
@@ -1169,6 +1390,14 @@ const makeS = (c: Colors) => StyleSheet.create({
 
   tabsScroll:{flexGrow:0, borderBottomWidth:0.5, borderBottomColor:c.border},
   tabs:      {flexDirection:'row'},
+
+  // Playlists
+  plNewBtn:    {flexDirection:'row', alignItems:'center', gap:10, paddingVertical:14, paddingHorizontal:16, borderBottomWidth:0.5, borderBottomColor:c.border},
+  plNewText:   {color:c.accent, fontSize:15, fontWeight:'600'},
+  plRow:       {flexDirection:'row', alignItems:'center', gap:12, paddingVertical:12, paddingHorizontal:16},
+  plIcon:      {width:44, height:44, borderRadius:8, backgroundColor:c.surface, alignItems:'center', justifyContent:'center'},
+  plDetailHeader: {flexDirection:'row', alignItems:'center', gap:4, paddingHorizontal:8, paddingVertical:8},
+  plDetailTitle:  {flex:1, color:c.text, fontSize:18, fontWeight:'600'},
   tab:       {width:46, alignItems:'center', paddingVertical:12, position:'relative'},
   tabLine:   {position:'absolute', bottom:0, left:'15%', right:'15%', height:2, backgroundColor:c.text, borderRadius:1},
 
