@@ -409,6 +409,69 @@ const eqS = StyleSheet.create({
   freq:      {fontSize:10, fontWeight:'600', marginTop:8},
 });
 
+// API de l'égaliseur passée au lecteur et à la page EQ dédiée.
+type EqApi = {
+  range: {minDb: number; maxDb: number} | null;
+  bands: PeqBand[];
+  onGainLive: (i: number, db: number) => void;
+  onGainCommit: (i: number, db: number) => void;
+  onSetFreq: (i: number, hz: number) => void;
+  onAddBand: () => void;
+  onRemoveBand: (i: number) => void;
+  onReset: () => void;
+};
+
+// Page égaliseur plein écran : aucune ScrollView parente → les sliders ne
+// rentrent jamais en conflit avec le défilement de la page.
+const EqualizerScreen = ({visible, onClose, eq, bright}: {
+  visible: boolean; onClose: () => void; eq: EqApi; bright: string;
+}) => {
+  if (!visible || !eq.range) return null;
+  return (
+    <View style={eqScrS.root}>
+      <StatusBar barStyle="light-content" backgroundColor="#0a0a0d"/>
+      <View style={eqScrS.header}>
+        <TouchableOpacity onPress={onClose} style={eqScrS.hBtn}>
+          <MaterialCommunityIcons name="chevron-down" size={28} color="#fff"/>
+        </TouchableOpacity>
+        <Text style={eqScrS.title}>Égaliseur</Text>
+        <TouchableOpacity onPress={eq.onReset} style={eqScrS.resetBtn}>
+          <Text style={eqScrS.resetTxt}>Réinitialiser</Text>
+        </TouchableOpacity>
+        <TouchableOpacity onPress={eq.onAddBand} style={eqScrS.hBtn}>
+          <MaterialCommunityIcons name="plus-circle-outline" size={24} color={bright}/>
+        </TouchableOpacity>
+      </View>
+      <View style={eqScrS.body}>
+        <ParametricEq
+          bands={eq.bands}
+          minDb={eq.range.minDb}
+          maxDb={eq.range.maxDb}
+          bright={bright}
+          onGainLive={eq.onGainLive}
+          onGainCommit={eq.onGainCommit}
+          onSetFreq={eq.onSetFreq}
+          onRemoveBand={eq.onRemoveBand}
+          onDragStart={() => {}}
+          onDragEnd={() => {}}
+        />
+        <Text style={eqScrS.hint}>Glisse une bande pour le gain · touche une fréquence pour la modifier · + pour ajouter une bande</Text>
+      </View>
+    </View>
+  );
+};
+
+const eqScrS = StyleSheet.create({
+  root:     {position:'absolute', top:0, left:0, right:0, bottom:0, backgroundColor:'#0a0a0d', zIndex:110},
+  header:   {flexDirection:'row', alignItems:'center', paddingTop:52, paddingHorizontal:12, paddingBottom:12},
+  hBtn:     {padding:6},
+  title:    {flex:1, color:'#fff', fontSize:20, fontWeight:'700', marginLeft:4},
+  resetBtn: {paddingHorizontal:10, paddingVertical:6},
+  resetTxt: {color:'#ffffff99', fontSize:13},
+  body:     {flex:1, justifyContent:'center', paddingHorizontal:8, paddingBottom:40},
+  hint:     {color:'#ffffff55', fontSize:11, textAlign:'center', marginTop:18, paddingHorizontal:24, lineHeight:16},
+});
+
 // ─── Helpers temps ────────────────────────────────────────────────────────────
 function fmtTime(sec: number): string {
   if (!isFinite(sec) || sec < 0) return '0:00';
@@ -418,20 +481,11 @@ function fmtTime(sec: number): string {
 }
 
 // ─── Player ───────────────────────────────────────────────────────────────────
-const PlayerScreen = ({track, onClose, queue, onRemoveFromQueue, eq}: {
+const PlayerScreen = ({track, onClose, queue, onRemoveFromQueue, eq, onOpenEq}: {
   track: Track; onClose: () => void; queue: Track[]; onRemoveFromQueue: (id: string) => void;
-  eq: {
-    range: {minDb: number; maxDb: number} | null;
-    bands: PeqBand[];
-    onGainLive: (i: number, db: number) => void;
-    onGainCommit: (i: number, db: number) => void;
-    onSetFreq: (i: number, hz: number) => void;
-    onAddBand: () => void;
-    onRemoveBand: (i: number) => void;
-  };
+  eq: EqApi; onOpenEq: () => void;
 }) => {
   const [sheetOpen, setSheetOpen] = useState(false);
-  const [eqDragging, setEqDragging] = useState(false); // fige le scroll pendant le réglage EQ
   const [addOpen,   setAddOpen]   = useState(false);
   const favorites = useFavorites();
   // Position en cours de glissement (ratio 0..1), null quand on ne touche pas la barre.
@@ -500,7 +554,7 @@ const PlayerScreen = ({track, onClose, queue, onRemoveFromQueue, eq}: {
         </TouchableOpacity>
       </View>
 
-      <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={pS.scroll} scrollEnabled={!eqDragging}>
+      <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={pS.scroll}>
         {/* Cover */}
         <View style={pS.coverWrap}>
           {coverUri ? (
@@ -573,35 +627,26 @@ const PlayerScreen = ({track, onClose, queue, onRemoveFromQueue, eq}: {
           </TouchableOpacity>
         </View>
 
-        {/* EQ */}
-        <View style={pS.section}>
-          <View style={pS.sectionHeader}>
-            <MaterialCommunityIcons name="equalizer-outline" size={14} color="#ffffff66"/>
+        {/* EQ — aperçu cliquable qui ouvre la page dédiée (sliders sans conflit de scroll) */}
+        {eq.range ? (
+          <TouchableOpacity style={pS.section} activeOpacity={0.8} onPress={onOpenEq}>
+            <View style={pS.sectionHeader}>
+              <MaterialCommunityIcons name="equalizer-outline" size={14} color="#ffffff66"/>
+              <Text style={pS.sectionTitle}>Égaliseur</Text>
+              <View style={{flex:1}}/>
+              <Text style={pS.eqOpenHint}>Régler</Text>
+              <MaterialCommunityIcons name="chevron-right" size={20} color="#ffffff88"/>
+            </View>
+            <View style={eqS.panel}>
+              <EqCurve bands={eq.bands} minDb={eq.range.minDb} maxDb={eq.range.maxDb} bright={palette.bright}/>
+            </View>
+          </TouchableOpacity>
+        ) : (
+          <View style={pS.section}>
             <Text style={pS.sectionTitle}>Égaliseur</Text>
-            <View style={{flex:1}}/>
-            {eq.range && (
-              <TouchableOpacity onPress={eq.onAddBand} hitSlop={{top:8, bottom:8, left:8, right:8}}>
-                <MaterialCommunityIcons name="plus-circle-outline" size={20} color={palette.bright}/>
-              </TouchableOpacity>
-            )}
+            <Text style={[pS.timeText, {paddingVertical:12}]}>Non disponible sur cet appareil.</Text>
           </View>
-          {eq.range ? (
-            <ParametricEq
-              bands={eq.bands}
-              minDb={eq.range.minDb}
-              maxDb={eq.range.maxDb}
-              bright={palette.bright}
-              onGainLive={eq.onGainLive}
-              onGainCommit={eq.onGainCommit}
-              onSetFreq={eq.onSetFreq}
-              onRemoveBand={eq.onRemoveBand}
-              onDragStart={() => setEqDragging(true)}
-              onDragEnd={() => setEqDragging(false)}
-            />
-          ) : (
-            <Text style={[pS.timeText, {paddingVertical:12}]}>Égaliseur non disponible sur cet appareil.</Text>
-          )}
-        </View>
+        )}
 
         {/* Queue */}
         <View style={pS.section}>
@@ -683,6 +728,7 @@ const pS = StyleSheet.create({
   section:       {paddingHorizontal:24, marginBottom:28},
   sectionHeader: {flexDirection:'row', alignItems:'center', gap:6, marginBottom:14},
   sectionTitle:  {fontSize:12, fontWeight:'600', color:'#ffffff66', textTransform:'uppercase', letterSpacing:0.8},
+  eqOpenHint:    {fontSize:12, color:'#ffffff88', marginRight:2},
   eqRow:         {flexDirection:'row', alignItems:'flex-end', height:EQ_HEIGHT+24, gap:4},
   queueRow:      {flexDirection:'row', alignItems:'center', gap:10, paddingVertical:10, borderBottomWidth:0.5, borderBottomColor:'#ffffff11'},
   queueCover:    {width:36, height:36, borderRadius:5, alignItems:'center', justifyContent:'center'},
@@ -1415,6 +1461,7 @@ export default function App() {
   const [page,         setPage]         = useState(0);
   const [currentTrack, setCurrentTrack] = useState<Track|null>(null);
   const [playerOpen,   setPlayerOpen]   = useState(false);
+  const [eqOpen,       setEqOpen]       = useState(false);
   const [tracks,       setTracks]       = useState<Track[]>(DEMO_TRACKS);
   const [scanState,    setScanState]    = useState<'idle'|'scanning'|'done'|'denied'>('idle');
   const [scanCount,    setScanCount]    = useState(0);
@@ -1535,6 +1582,17 @@ export default function App() {
       return next;
     });
     setEqPref('Personnalisé');
+  }, [setEqPref]);
+
+  // Remet toutes les bandes à plat (gain 0), garde les fréquences
+  const onResetBands = useCallback(() => {
+    setEqBands(prev => {
+      const next = prev.map(b => ({...b, gain: 0}));
+      peqConfigure(next);
+      persistBands(next);
+      return next;
+    });
+    setEqPref('Aucun');
   }, [setEqPref]);
 
   // Supprime une bande (garde au moins une)
@@ -1661,9 +1719,16 @@ export default function App() {
           onClose={() => setPlayerOpen(false)}
           queue={tracks.slice(0, 30)}
           onRemoveFromQueue={() => {}}
-          eq={{range: peqRange, bands: eqBands, onGainLive, onGainCommit, onSetFreq, onAddBand, onRemoveBand}}
+          eq={{range: peqRange, bands: eqBands, onGainLive, onGainCommit, onSetFreq, onAddBand, onRemoveBand, onReset: onResetBands}}
+          onOpenEq={() => setEqOpen(true)}
         />
       )}
+      <EqualizerScreen
+        visible={eqOpen}
+        onClose={() => setEqOpen(false)}
+        eq={{range: peqRange, bands: eqBands, onGainLive, onGainCommit, onSetFreq, onAddBand, onRemoveBand, onReset: onResetBands}}
+        bright={getPalette(currentTrack?.genre).bright}
+      />
     </SafeAreaView>
     </ThemeCtx.Provider>
   );
