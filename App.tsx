@@ -252,10 +252,15 @@ const EqBand = ({freq, gain, bright, minDb, maxDb, onLive, onCommit, onEditFreq}
   // Synchronise quand la valeur change de l'extérieur (préréglage / reconfig)
   useEffect(() => { setDb(gain); }, [gain]);
 
+  // On ne capte que les gestes nettement VERTICAUX (réglage du gain) : ainsi la
+  // page ne défile pas pendant le drag, et les gestes horizontaux restent
+  // disponibles pour scroller les bandes.
+  const vertical = (gs: {dx: number; dy: number}) => Math.abs(gs.dy) > Math.abs(gs.dx) && Math.abs(gs.dy) > 4;
   const pan = useRef(
     PanResponder.create({
-      onStartShouldSetPanResponder: () => true,
-      onMoveShouldSetPanResponder: () => true,
+      onMoveShouldSetPanResponder: (_, gs) => vertical(gs),
+      onMoveShouldSetPanResponderCapture: (_, gs) => vertical(gs),
+      onPanResponderTerminationRequest: () => false, // ne pas céder le geste à la ScrollView
       onPanResponderGrant: () => { startRef.current = dbRef.current; },
       onPanResponderMove: (_, gs) => {
         const startRatio = (startRef.current - minDb) / span;
