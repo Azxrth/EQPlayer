@@ -573,13 +573,16 @@ const TrackGridItem = ({track, onPress}: {track: any; onPress?: () => void}) => 
 };
 
 // ─── CategoryGridItem (genres/années/etc.) ────────────────────────────────────
-const CategoryGridItem = ({name, sub, icon}: {name: string; sub: string; icon?: string}) => {
+const CategoryGridItem = ({name, sub, icon, artUri, onPress}: {name: string; sub: string; icon?: string; artUri?: string; onPress?: () => void}) => {
   const {gS} = useStyles();
   const c = useColors();
   return (
-  <TouchableOpacity style={gS.item} activeOpacity={0.75}>
+  <TouchableOpacity style={gS.item} activeOpacity={0.75} onPress={onPress}>
     <View style={gS.catCover}>
-      <MaterialCommunityIcons name={(icon ?? 'music') as any} size={28} color={c.iconDim}/>
+      {artUri
+        ? <Image source={{uri: artUri}} style={StyleSheet.absoluteFill} resizeMode="cover"/>
+        : <MaterialCommunityIcons name={(icon ?? 'music') as any} size={28} color={c.iconDim}/>
+      }
     </View>
     <Text style={gS.title} numberOfLines={2}>{name}</Text>
     <Text style={gS.sub}   numberOfLines={1}>{sub}</Text>
@@ -602,7 +605,7 @@ const TrackGrid = ({tracks, onPress}: {tracks: any[]; onPress?: (t: any) => void
   );
 };
 
-const CategoryGrid = ({items, icon}: {items: {name: string; sub: string}[]; icon?: string}) => {
+const CategoryGrid = ({items, icon, onOpen}: {items: {name: string; sub: string; artUri?: string}[]; icon?: string; onOpen?: (item: {name: string; sub: string; artUri?: string}) => void}) => {
   const {gS} = useStyles();
   return (
   <FlatList
@@ -611,7 +614,7 @@ const CategoryGrid = ({items, icon}: {items: {name: string; sub: string}[]; icon
     numColumns={GRID_COLS}
     contentContainerStyle={gS.list}
     columnWrapperStyle={gS.row}
-    renderItem={({item}) => <CategoryGridItem name={item.name} sub={item.sub} icon={icon}/>}
+    renderItem={({item}) => <CategoryGridItem name={item.name} sub={item.sub} icon={icon} artUri={item.artUri} onPress={onOpen ? () => onOpen(item) : undefined}/>}
   />
   );
 };
@@ -629,14 +632,14 @@ const makeGS = (c: Colors) => StyleSheet.create({
 });
 
 // ─── Toolbar ──────────────────────────────────────────────────────────────────
-const Toolbar = ({count, label, view, onView}: {
-  count: number; label: string; view: ViewMode; onView: (v: ViewMode) => void;
+const Toolbar = ({count, label, view, onView, onPlayAll}: {
+  count: number; label: string; view: ViewMode; onView: (v: ViewMode) => void; onPlayAll?: () => void;
 }) => {
   const {S} = useStyles();
   const c = useColors();
   return (
   <View style={S.toolbar}>
-    <TouchableOpacity style={S.playAll}>
+    <TouchableOpacity style={S.playAll} onPress={onPlayAll}>
       <MaterialCommunityIcons name="play-circle-outline" size={20} color={c.textDim} style={{marginRight:6}}/>
       <Text style={S.playAllText}>Tout lire  {count} {label}</Text>
     </TouchableOpacity>
@@ -670,118 +673,107 @@ const EmptyState = ({msg, sub}: {msg: string; sub: string}) => {
 };
 
 // ─── Library Page ─────────────────────────────────────────────────────────────
-const LibraryPage = ({tracks, onTrackPress}: {tracks: Track[]; onTrackPress: (t: Track) => void}) => {
+type CatItem = {name: string; sub: string; id: string; artUri?: string; filter: (t: Track) => boolean};
+
+const LibraryPage = ({tracks, onTrackPress}: {tracks: Track[]; onTrackPress: (t: Track, queue?: Track[]) => void}) => {
   const [activeTab, setActiveTab] = useState(0);
   const [view, setView] = useState<ViewMode>('list');
-  const {S, gS} = useStyles();
+  // Catégorie ouverte (drill-in) : la liste des morceaux qu'elle contient.
+  const [drill, setDrill] = useState<{label: string; items: Track[]} | null>(null);
+  const {S} = useStyles();
   const c = useColors();
 
+  const selectTab = (i: number) => { setActiveTab(i); setDrill(null); };
+  const openCategory = (item: CatItem) => setDrill({label: item.name, items: tracks.filter(item.filter)});
+
+  // Rendu générique d'une catégorie (liste ou grille), entièrement cliquable.
+  const renderCategory = (items: CatItem[], label: string, icon: string) => (
+    <>
+      <Toolbar count={items.length} label={label} view={view} onView={setView}/>
+      {view === 'grid'
+        ? <CategoryGrid items={items} icon={icon} onOpen={it => openCategory(it as CatItem)}/>
+        : <FlatList data={items} keyExtractor={i=>i.id} initialNumToRender={20}
+            renderItem={({item}) => (
+              <TrackRow
+                track={{title:item.name, artist:item.sub, artUri:item.artUri, format:'', genre:'', year:''}}
+                onPress={() => openCategory(item)}/>
+            )}/>
+      }
+    </>
+  );
+
   const renderContent = () => {
+    // Vue détail d'une catégorie : ses morceaux, jouables (file = la catégorie).
+    if (drill) {
+      return (
+        <View style={S.content}>
+          <View style={S.plDetailHeader}>
+            <TouchableOpacity onPress={() => setDrill(null)} style={S.headerBtn}>
+              <MaterialCommunityIcons name="chevron-left" size={26} color={c.text}/>
+            </TouchableOpacity>
+            <Text style={S.plDetailTitle} numberOfLines={1}>{drill.label}</Text>
+          </View>
+          <Toolbar count={drill.items.length} label="pistes" view={view} onView={setView}
+            onPlayAll={() => drill.items.length && onTrackPress(drill.items[0], drill.items)}/>
+          {view === 'grid'
+            ? <TrackGrid tracks={drill.items} onPress={t => onTrackPress(t, drill.items)}/>
+            : <FlatList data={drill.items} keyExtractor={i=>i.id} initialNumToRender={20}
+                renderItem={({item}) => <TrackRow track={item} onPress={() => onTrackPress(item, drill.items)}/>}/>
+          }
+        </View>
+      );
+    }
+
     // Titres
     if (activeTab === 0) return (
       <>
-        <Toolbar count={tracks.length} label="pistes" view={view} onView={setView}/>
+        <Toolbar count={tracks.length} label="pistes" view={view} onView={setView}
+          onPlayAll={() => tracks.length && onTrackPress(tracks[0], tracks)}/>
         {view === 'grid'
-          ? <TrackGrid tracks={tracks} onPress={onTrackPress}/>
+          ? <TrackGrid tracks={tracks} onPress={t => onTrackPress(t, tracks)}/>
           : <FlatList
               data={tracks}
               keyExtractor={i=>i.id}
               initialNumToRender={20}
               maxToRenderPerBatch={20}
               windowSize={10}
-              renderItem={({item}) => <TrackRow track={item} onPress={() => onTrackPress(item)}/>}
+              renderItem={({item}) => <TrackRow track={item} onPress={() => onTrackPress(item, tracks)}/>}
             />
         }
       </>
     );
     // Artistes
     if (activeTab === 1) {
-      const items = [...new Set(tracks.map(t=>t.artist))].sort().map(a=>({name:a, sub:tracks.filter(t=>t.artist===a).length+' pistes'}));
-      return (
-        <>
-          <Toolbar count={items.length} label="artistes" view={view} onView={setView}/>
-          {view === 'grid'
-            ? <CategoryGrid items={items} icon="account"/>
-            : <FlatList data={items} keyExtractor={i=>i.name} initialNumToRender={20} renderItem={({item}) => <TrackRow track={{title:item.name, artist:item.sub, format:'', genre:'', year:''}}/>}/>
-          }
-        </>
-      );
+      const items: CatItem[] = [...new Set(tracks.map(t=>t.artist))].sort()
+        .map(a => ({name:a, id:'artist:'+a, sub:tracks.filter(t=>t.artist===a).length+' pistes', filter:(t:Track)=>t.artist===a}));
+      return renderCategory(items, 'artistes', 'account');
     }
     // Albums
     if (activeTab === 2) {
-      const albumMap = new Map<string, {name:string; sub:string; genre:string; artUri?:string}>();
+      const albumMap = new Map<string, CatItem>();
       tracks.forEach(t => {
-        if (!albumMap.has(t.album)) albumMap.set(t.album, {name:t.album, sub:t.artist, genre:t.genre, artUri:t.artUri});
+        if (!albumMap.has(t.album)) albumMap.set(t.album, {name:t.album, id:'album:'+t.album, sub:t.artist, artUri:t.artUri, filter:(x:Track)=>x.album===t.album});
       });
       const items = [...albumMap.values()].sort((a,b) => a.name.localeCompare(b.name));
-      return (
-        <>
-          <Toolbar count={items.length} label="albums" view={view} onView={setView}/>
-          {view === 'grid'
-            ? <FlatList
-                data={items}
-                keyExtractor={i=>i.name}
-                numColumns={GRID_COLS}
-                contentContainerStyle={gS.list}
-                columnWrapperStyle={gS.row}
-                initialNumToRender={15}
-                renderItem={({item}) => (
-                  <TouchableOpacity style={gS.item} activeOpacity={0.75}>
-                    <View style={[gS.cover, {backgroundColor: coverBg(item.genre)}]}>
-                      {item.artUri
-                        ? <Image source={{uri: item.artUri}} style={StyleSheet.absoluteFill} resizeMode="cover"/>
-                        : <MaterialCommunityIcons name="album" size={24} color="#ffffff22"/>
-                      }
-                    </View>
-                    <Text style={gS.title} numberOfLines={2}>{item.name}</Text>
-                    <Text style={gS.sub}   numberOfLines={1}>{item.sub}</Text>
-                  </TouchableOpacity>
-                )}
-              />
-            : <FlatList data={items} keyExtractor={i=>i.name} initialNumToRender={20} renderItem={({item}) => <TrackRow track={{title:item.name, artist:item.sub, format:'', genre:item.genre, year:'', artUri:item.artUri}}/>}/>
-          }
-        </>
-      );
+      return renderCategory(items, 'albums', 'album');
     }
     // Genres
     if (activeTab === 3) {
-      const items = [...new Set(tracks.map(t=>t.genre).filter(Boolean))].sort().map(g=>({name:g, sub:tracks.filter(t=>t.genre===g).length+' pistes', id:g}));
-      return (
-        <>
-          <Toolbar count={items.length} label="genres" view={view} onView={setView}/>
-          {view === 'grid'
-            ? <CategoryGrid items={items} icon="music-circle-outline"/>
-            : <FlatList data={items} keyExtractor={i=>i.id} renderItem={({item}) => <TrackRow track={{title:item.name, artist:item.sub, format:'', genre:item.name, year:''}}/>}/>
-          }
-        </>
-      );
+      const items: CatItem[] = [...new Set(tracks.map(t=>t.genre).filter(Boolean))].sort()
+        .map(g => ({name:g, id:'genre:'+g, sub:tracks.filter(t=>t.genre===g).length+' pistes', filter:(t:Track)=>t.genre===g}));
+      return renderCategory(items, 'genres', 'music-circle-outline');
     }
     // Dossiers
     if (activeTab === 4) {
       const folders = [...new Set(tracks.map(t => t.filePath?.split('/').slice(0,-1).join('/') ?? '').filter(Boolean))];
-      const items = folders.map(f => ({name: f.split('/').pop() ?? f, sub: tracks.filter(t=>t.filePath?.startsWith(f)).length + ' pistes', id: f}));
-      return (
-        <>
-          <Toolbar count={items.length} label="dossiers" view={view} onView={setView}/>
-          {view === 'grid'
-            ? <CategoryGrid items={items.map(i=>({name:i.name, sub:i.sub}))} icon="folder-outline"/>
-            : <FlatList data={items} keyExtractor={i=>i.id} initialNumToRender={20} renderItem={({item}) => <TrackRow track={{title:item.name, artist:item.sub, format:'', genre:'', year:''}}/>}/>
-          }
-        </>
-      );
+      const items: CatItem[] = folders.map(f => ({name: f.split('/').pop() ?? f, id:'folder:'+f, sub: tracks.filter(t=>t.filePath?.startsWith(f)).length + ' pistes', filter:(t:Track)=>!!t.filePath?.startsWith(f)}));
+      return renderCategory(items, 'dossiers', 'folder-outline');
     }
     // Années
     if (activeTab === 5) {
-      const items = [...new Set(tracks.map(t=>t.year).filter(Boolean))].sort((a,b)=>Number(b)-Number(a)).map(y=>({name:y, sub:tracks.filter(t=>t.year===y).length+' pistes', id:y}));
-      return (
-        <>
-          <Toolbar count={items.length} label="annees" view={view} onView={setView}/>
-          {view === 'grid'
-            ? <CategoryGrid items={items} icon="calendar-outline"/>
-            : <FlatList data={items} keyExtractor={i=>i.id} renderItem={({item}) => <TrackRow track={{title:item.name, artist:item.sub, format:'', genre:'', year:item.name}}/>}/>
-          }
-        </>
-      );
+      const items: CatItem[] = [...new Set(tracks.map(t=>t.year).filter(Boolean))].sort((a,b)=>Number(b)-Number(a))
+        .map(y => ({name:y, id:'year:'+y, sub:tracks.filter(t=>t.year===y).length+' pistes', filter:(t:Track)=>t.year===y}));
+      return renderCategory(items, 'annees', 'calendar-outline');
     }
     // Sampling — regroupement par qualité audio (taux d'échantillonnage / DSD)
     if (activeTab === 6) {
@@ -792,33 +784,17 @@ const LibraryPage = ({tracks, onTrackPress}: {tracks: Track[]; onTrackPress: (t:
         if (ex) ex.count++;
         else groups.set(g.key, {label: g.label, rate: g.rate, count: 1});
       });
-      const items = [...groups.values()]
-        .sort((a, b) => a.rate - b.rate)
-        .map(g => ({name: g.label, sub: g.count + ' pistes', id: g.label}));
-      return (
-        <>
-          <Toolbar count={items.length} label="qualites" view={view} onView={setView}/>
-          {items.length === 0
-            ? <EmptyState msg="Qualité audio" sub="Aucune info de taux d'échantillonnage"/>
-            : view === 'grid'
-              ? <CategoryGrid items={items} icon="sine-wave"/>
-              : <FlatList data={items} keyExtractor={i=>i.id} renderItem={({item}) => <TrackRow track={{title:item.name, artist:item.sub, format:'', genre:'', year:''}}/>}/>
-          }
-        </>
-      );
+      const items: CatItem[] = [...groups.entries()]
+        .sort((a, b) => a[1].rate - b[1].rate)
+        .map(([key, g]) => ({name: g.label, id:'q:'+key, sub: g.count + ' pistes', filter:(t:Track)=>qualityGroup(t).key===key}));
+      if (items.length === 0) return <EmptyState msg="Qualité audio" sub="Aucune info de taux d'échantillonnage"/>;
+      return renderCategory(items, 'qualites', 'sine-wave');
     }
     // Format
     if (activeTab === 7) {
-      const items = [...new Set(tracks.map(t=>t.format).filter(Boolean))].sort().map(f=>({name:f, sub:tracks.filter(t=>t.format===f).length+' pistes', id:f}));
-      return (
-        <>
-          <Toolbar count={items.length} label="formats" view={view} onView={setView}/>
-          {view === 'grid'
-            ? <CategoryGrid items={items} icon="file-music-outline"/>
-            : <FlatList data={items} keyExtractor={i=>i.id} renderItem={({item}) => <TrackRow track={{title:item.name, artist:item.sub, format:item.name, genre:'', year:''}}/>}/>
-          }
-        </>
-      );
+      const items: CatItem[] = [...new Set(tracks.map(t=>t.format).filter(Boolean))].sort()
+        .map(f => ({name:f, id:'fmt:'+f, sub:tracks.filter(t=>t.format===f).length+' pistes', filter:(t:Track)=>t.format===f}));
+      return renderCategory(items, 'formats', 'file-music-outline');
     }
     return null;
   };
@@ -835,7 +811,7 @@ const LibraryPage = ({tracks, onTrackPress}: {tracks: Track[]; onTrackPress: (t:
       <ScrollView horizontal showsHorizontalScrollIndicator={false} style={S.tabsScroll}>
         <View style={S.tabs}>
           {LIB_TABS.map((t,i) => (
-            <TouchableOpacity key={i} style={S.tab} onPress={() => setActiveTab(i)}>
+            <TouchableOpacity key={i} style={S.tab} onPress={() => selectTab(i)}>
               <MaterialCommunityIcons name={t.icon as any} size={18} color={activeTab===i?c.icon:c.iconDim}/>
               {activeTab===i && <View style={S.tabLine}/>}
             </TouchableOpacity>
@@ -1370,11 +1346,11 @@ export default function App() {
                : DARK;
   const {S} = stylesFor(colors);
 
-  const openTrack = useCallback(async (t: Track) => {
+  const openTrack = useCallback(async (t: Track, queue?: Track[]) => {
     setCurrentTrack(t);
     setPlayerOpen(true);
-    // Charge la file depuis la bibliothèque et démarre la lecture
-    await playTrack(t, tracks);
+    // File = la liste fournie (catégorie/playlist) ou toute la bibliothèque.
+    await playTrack(t, queue ?? tracks);
   }, [tracks, playTrack]);
 
   return (
