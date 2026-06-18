@@ -10,7 +10,6 @@ import {
   StatusBar,
   Dimensions,
   PanResponder,
-  Animated,
   Image,
   Modal,
   Alert,
@@ -197,58 +196,145 @@ const GRID_PAD    = 12;   // padding extérieur
 const GRID_GAP    = 6;    // espace entre items
 const GRID_ITEM_W = (width - GRID_PAD * 2 - GRID_GAP * (GRID_COLS - 1)) / GRID_COLS;
 
-// ─── EQ draggable ─────────────────────────────────────────────────────────────
-const EQ_HEIGHT = 120;
+// ─── Égaliseur tactile ────────────────────────────────────────────────────────
+const EQ_HEIGHT = 130;     // hauteur des sliders
+const EQ_CURVE_H = 86;     // hauteur de la courbe de réponse
+const CURVE_BARS = 64;     // résolution de la courbe (barres fines, pas de SVG)
 
-// Curseur de bande contrôlé : value/min/max en millibels, onChange à la fin du geste.
-const EqBar = ({label, bright, min, max, value, onChange}: {
-  label: string; bright: string; min: number; max: number; value: number; onChange: (mb: number) => void;
+// Interpolation dB linéaire en échelle log-fréquence (entre les centres de bande)
+function eqInterp(pts: {hz: number; db: number}[], hz: number): number {
+  if (pts.length === 0) return 0;
+  if (hz <= pts[0].hz) return pts[0].db;
+  const last = pts[pts.length - 1];
+  if (hz >= last.hz) return last.db;
+  for (let i = 0; i < pts.length - 1; i++) {
+    const a = pts[i], b = pts[i + 1];
+    if (hz >= a.hz && hz <= b.hz) {
+      const t = (Math.log(hz) - Math.log(a.hz)) / (Math.log(b.hz) - Math.log(a.hz));
+      return a.db + t * (b.db - a.db);
+    }
+  }
+  return 0;
+}
+
+// Courbe de réponse : aire remplie approximée par des barres fines (sans SVG).
+const EqCurve = ({info, levels, bright}: {info: EqInfo; levels: number[]; bright: string}) => {
+  const minDb = info.minLevel / 100;
+  const maxDb = info.maxLevel / 100;
+  const span = (maxDb - minDb) || 1;
+  const pts = info.bands
+    .map((b, i) => ({hz: b.centerFreq / 1000, db: (levels[i] ?? b.level) / 100}))
+    .sort((a, b) => a.hz - b.hz);
+  const lnMin = Math.log(20), lnMax = Math.log(20000);
+  const zeroH = ((0 - minDb) / span) * EQ_CURVE_H;
+  return (
+    <View style={[eqS.curveWrap, {height: EQ_CURVE_H}]}>
+      <View style={[eqS.zeroLine, {bottom: zeroH}]}/>
+      <View style={eqS.curveRow}>
+        {Array.from({length: CURVE_BARS}, (_, k) => {
+          const hz = Math.exp(lnMin + (k / (CURVE_BARS - 1)) * (lnMax - lnMin));
+          const db = eqInterp(pts, hz);
+          const h = Math.max(2, ((db - minDb) / span) * EQ_CURVE_H);
+          return <View key={k} style={{flex: 1, height: h, backgroundColor: bright}}/>;
+        })}
+      </View>
+    </View>
+  );
+};
+
+// Slider de bande : zone tactile large, application audio en temps réel.
+const EqBand = ({bandIndex, label, bright, min, max, value, onCommit}: {
+  bandIndex: number; label: string; bright: string; min: number; max: number; value: number; onCommit: (mb: number) => void;
 }) => {
-  const span  = (max - min) || 1;
-  const ratio = Math.max(0, Math.min(1, (value - min) / span));
-  const anim  = useRef(new Animated.Value(ratio)).current;
-  const rRef  = useRef(ratio);   // ratio courant
-  const start = useRef(ratio);   // ratio au début du geste
-  const cb    = useRef({min, span, onChange});
-  cb.current = {min, span, onChange};
-
-  // Synchronise quand la valeur change de l'extérieur (préréglage)
-  useEffect(() => { rRef.current = ratio; anim.setValue(ratio); }, [ratio, anim]);
+  const span = (max - min) || 1;
+  const [mb, setMb] = useState(value);
+  const mbRef = useRef(mb); mbRef.current = mb;
+  const startRef = useRef(mb);
+  // Synchronise quand la valeur change de l'extérieur (préréglage appliqué)
+  useEffect(() => { setMb(value); }, [value]);
 
   const pan = useRef(
     PanResponder.create({
       onStartShouldSetPanResponder: () => true,
       onMoveShouldSetPanResponder: () => true,
-      onPanResponderGrant: () => { start.current = rRef.current; },
+      onPanResponderGrant: () => { startRef.current = mbRef.current; setEqEnabled(true); },
       onPanResponderMove: (_, gs) => {
-        const r = Math.max(0, Math.min(1, start.current - gs.dy / EQ_HEIGHT));
-        rRef.current = r;
-        anim.setValue(r);
+        const startRatio = (startRef.current - min) / span;
+        const r = Math.max(0, Math.min(1, startRatio - gs.dy / EQ_HEIGHT));
+        const v = Math.round(min + r * span);
+        setMb(v);
+        setBandLevel(bandIndex, v); // audio en temps réel pendant le glissement
       },
-      onPanResponderRelease: () => {
-        const {min: lo, span: sp, onChange: cbFn} = cb.current;
-        cbFn(Math.round(lo + rRef.current * sp));
-      },
+      onPanResponderRelease: () => { onCommit(Math.round(mbRef.current)); },
     }),
   ).current;
 
-  const filledH = anim.interpolate({inputRange:[0,1], outputRange:[0, EQ_HEIGHT]});
+  const ratio = Math.max(0, Math.min(1, (mb - min) / span));
+  const zeroRatio = Math.max(0, Math.min(1, (0 - min) / span));
+  const knobBottom = ratio * EQ_HEIGHT;
+  const segBottom = Math.min(ratio, zeroRatio) * EQ_HEIGHT;
+  const segHeight = Math.abs(ratio - zeroRatio) * EQ_HEIGHT;
+  const db = mb / 100;
+
   return (
     <View style={eqS.band}>
-      <View style={[eqS.track, {height:EQ_HEIGHT}]} {...pan.panHandlers}>
-        <Animated.View style={[eqS.fill, {height:filledH, backgroundColor:bright}]}/>
-        <Animated.View style={[eqS.thumb, {backgroundColor:bright, bottom:filledH}]}/>
+      <Text style={[eqS.gain, {color: bright}]}>{db > 0 ? '+' : ''}{db.toFixed(1)}</Text>
+      <View style={[eqS.slider, {height: EQ_HEIGHT}]} {...pan.panHandlers}>
+        <View style={eqS.sliderTrack}/>
+        <View style={[eqS.seg, {bottom: segBottom, height: segHeight, backgroundColor: bright}]}/>
+        <View style={[eqS.knob, {bottom: knobBottom - 9, backgroundColor: bright}]}/>
       </View>
-      <Text style={eqS.label}>{label}</Text>
+      <Text style={eqS.freq}>{label}</Text>
     </View>
   );
 };
+
+// Panneau égaliseur complet : courbe + sliders + échelle de gain.
+const Equalizer = ({info, levels, bright, onBandChange}: {
+  info: EqInfo; levels: number[]; bright: string; onBandChange: (band: number, mb: number) => void;
+}) => {
+  const maxDb = Math.round(info.maxLevel / 100);
+  return (
+    <View style={eqS.panel}>
+      <EqCurve info={info} levels={levels} bright={bright}/>
+      <View style={eqS.bandsRow}>
+        <View style={eqS.scale}>
+          <Text style={eqS.scaleTxt}>+{maxDb}</Text>
+          <Text style={eqS.scaleTxt}>0</Text>
+          <Text style={eqS.scaleTxt}>-{maxDb}</Text>
+        </View>
+        {info.bands.map((band, i) => (
+          <EqBand
+            key={band.index}
+            bandIndex={band.index}
+            label={freqLabel(band.centerFreq)}
+            bright={bright}
+            min={info.minLevel}
+            max={info.maxLevel}
+            value={levels[i] ?? band.level}
+            onCommit={mb => onBandChange(band.index, mb)}
+          />
+        ))}
+      </View>
+    </View>
+  );
+};
+
 const eqS = StyleSheet.create({
-  band:  {alignItems:'center', gap:4, flex:1},
-  track: {width:4, backgroundColor:'#222', borderRadius:2, justifyContent:'flex-end', overflow:'visible', position:'relative'},
-  fill:  {width:4, borderRadius:2},
-  thumb: {width:14, height:14, borderRadius:7, position:'absolute', left:-5, bottom:0, borderWidth:2, borderColor:'#000'},
-  label: {fontSize:9, color:'#555', marginTop:2},
+  panel:     {backgroundColor:'#0c0c0fcc', borderRadius:12, padding:12, marginTop:6},
+  curveWrap: {position:'relative', overflow:'hidden', borderRadius:6, backgroundColor:'#ffffff08'},
+  curveRow:  {flexDirection:'row', alignItems:'flex-end', height:'100%', opacity:0.55},
+  zeroLine:  {position:'absolute', left:0, right:0, height:1, backgroundColor:'#ffffff22'},
+  bandsRow:  {flexDirection:'row', alignItems:'flex-end', marginTop:12},
+  scale:     {height:EQ_HEIGHT, justifyContent:'space-between', alignItems:'flex-end', marginBottom:18, marginRight:8, width:26},
+  scaleTxt:  {fontSize:9, color:'#ffffff44'},
+  band:      {flex:1, alignItems:'center'},
+  gain:      {fontSize:11, fontWeight:'600', marginBottom:6},
+  slider:    {width:'100%', alignItems:'center', position:'relative'},
+  sliderTrack:{position:'absolute', top:0, bottom:0, width:2, marginLeft:-1, left:'50%', backgroundColor:'#ffffff1f', borderRadius:1},
+  seg:       {position:'absolute', width:3, marginLeft:-1.5, left:'50%', borderRadius:2},
+  knob:      {position:'absolute', left:'50%', marginLeft:-9, width:18, height:18, borderRadius:9, borderWidth:2, borderColor:'#000'},
+  freq:      {fontSize:9, color:'#888', marginTop:8},
 });
 
 // ─── Helpers temps ────────────────────────────────────────────────────────────
@@ -411,21 +497,19 @@ const PlayerScreen = ({track, onClose, queue, onRemoveFromQueue, eqInfo, eqLevel
           <View style={pS.sectionHeader}>
             <MaterialCommunityIcons name="equalizer-outline" size={14} color="#ffffff66"/>
             <Text style={pS.sectionTitle}>Égaliseur</Text>
+            <View style={{flex:1}}/>
+            {eqInfo && (
+              <TouchableOpacity
+                onPress={() => Alert.alert(
+                  'Ajouter une fréquence',
+                  `L'égaliseur matériel de cet appareil a ${eqInfo.numberOfBands} bandes fixes (${eqInfo.bands.map(b => freqLabel(b.centerFreq)).join(', ')} Hz) et ne permet pas d'ajouter de fréquence. Un égaliseur paramétrique (fréquences libres) nécessiterait un moteur audio dédié.`,
+                )}>
+                <MaterialCommunityIcons name="plus-circle-outline" size={18} color="#ffffff88"/>
+              </TouchableOpacity>
+            )}
           </View>
           {eqInfo ? (
-            <View style={pS.eqRow}>
-              {eqInfo.bands.map((band, i) => (
-                <EqBar
-                  key={band.index}
-                  label={freqLabel(band.centerFreq)}
-                  bright={palette.bright}
-                  min={eqInfo.minLevel}
-                  max={eqInfo.maxLevel}
-                  value={eqLevels[i] ?? band.level}
-                  onChange={mb => onBandChange(band.index, mb)}
-                />
-              ))}
-            </View>
+            <Equalizer info={eqInfo} levels={eqLevels} bright={palette.bright} onBandChange={onBandChange}/>
           ) : (
             <Text style={[pS.timeText, {paddingVertical:12}]}>Égaliseur non disponible sur cet appareil.</Text>
           )}
