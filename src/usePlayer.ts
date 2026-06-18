@@ -133,11 +133,15 @@ async function applyMode(mode: PlayMode, prev: PlayMode) {
   if (mode === 'shuffle') await reshuffleUpcoming();
 }
 
-// Convertit un Track de l'app en objet TrackPlayer
+// Convertit un Track de l'app en objet TrackPlayer.
+// On joue via l'URI MediaStore content:// (id = _ID MediaStore) plutôt que le
+// chemin file:// : sous Android scoped storage, l'accès file:// aux fichiers sur
+// carte SD amovible est refusé, alors que content:// fonctionne (READ_MEDIA_AUDIO).
 export function toPlayerTrack(t: any) {
   return {
     id:       t.id,
-    url:      t.filePath ? `file://${t.filePath}` : '',
+    url:      t.id ? `content://media/external/audio/media/${t.id}`
+            : t.filePath ? `file://${t.filePath}` : '',
     title:    t.title,
     artist:   t.artist,
     album:    t.album,
