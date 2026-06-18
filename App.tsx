@@ -241,9 +241,10 @@ const EqCurve = ({bands, minDb, maxDb, bright}: {bands: PeqBand[]; minDb: number
 };
 
 // Slider de bande : gain draggable (audio live) + fréquence éditable au tap.
-const EqBand = ({freq, gain, bright, minDb, maxDb, onLive, onCommit, onEditFreq}: {
+const EqBand = ({freq, gain, bright, minDb, maxDb, onLive, onCommit, onEditFreq, onDragStart, onDragEnd}: {
   freq: number; gain: number; bright: string; minDb: number; maxDb: number;
   onLive: (db: number) => void; onCommit: (db: number) => void; onEditFreq: () => void;
+  onDragStart: () => void; onDragEnd: () => void;
 }) => {
   const span = (maxDb - minDb) || 1;
   const [db, setDb] = useState(gain);
@@ -252,24 +253,29 @@ const EqBand = ({freq, gain, bright, minDb, maxDb, onLive, onCommit, onEditFreq}
   // Synchronise quand la valeur change de l'extérieur (préréglage / reconfig)
   useEffect(() => { setDb(gain); }, [gain]);
 
-  // On ne capte que les gestes nettement VERTICAUX (réglage du gain) : ainsi la
-  // page ne défile pas pendant le drag, et les gestes horizontaux restent
-  // disponibles pour scroller les bandes.
-  const vertical = (gs: {dx: number; dy: number}) => Math.abs(gs.dy) > Math.abs(gs.dx) && Math.abs(gs.dy) > 4;
+  // Le slider revendique le toucher dès le départ (phases start + capture) et
+  // refuse de céder le geste : la page ne défile pas pendant le réglage. En plus,
+  // onDragStart/End fige le défilement de la ScrollView parente par sécurité.
+  const cb = useRef({onLive, onCommit, onDragStart, onDragEnd, minDb, span});
+  cb.current = {onLive, onCommit, onDragStart, onDragEnd, minDb, span};
   const pan = useRef(
     PanResponder.create({
-      onMoveShouldSetPanResponder: (_, gs) => vertical(gs),
-      onMoveShouldSetPanResponderCapture: (_, gs) => vertical(gs),
-      onPanResponderTerminationRequest: () => false, // ne pas céder le geste à la ScrollView
-      onPanResponderGrant: () => { startRef.current = dbRef.current; },
+      onStartShouldSetPanResponder: () => true,
+      onStartShouldSetPanResponderCapture: () => true,
+      onMoveShouldSetPanResponder: () => true,
+      onMoveShouldSetPanResponderCapture: () => true,
+      onPanResponderTerminationRequest: () => false,
+      onShouldBlockNativeResponder: () => true,
+      onPanResponderGrant: () => { startRef.current = dbRef.current; cb.current.onDragStart(); },
       onPanResponderMove: (_, gs) => {
-        const startRatio = (startRef.current - minDb) / span;
+        const startRatio = (startRef.current - cb.current.minDb) / cb.current.span;
         const r = Math.max(0, Math.min(1, startRatio - gs.dy / EQ_HEIGHT));
-        const v = Math.round((minDb + r * span) * 10) / 10;
+        const v = Math.round((cb.current.minDb + r * cb.current.span) * 10) / 10;
         setDb(v);
-        onLive(v); // audio en temps réel pendant le glissement
+        cb.current.onLive(v); // audio en temps réel pendant le glissement
       },
-      onPanResponderRelease: () => { onCommit(dbRef.current); },
+      onPanResponderRelease: () => { cb.current.onCommit(dbRef.current); cb.current.onDragEnd(); },
+      onPanResponderTerminate: () => { cb.current.onDragEnd(); },
     }),
   ).current;
 
@@ -341,16 +347,19 @@ const FreqEditModal = ({visible, freq, onClose, onSubmit, onRemove}: {
 };
 
 // Panneau égaliseur paramétrique : courbe + sliders + fréquences éditables.
-const ParametricEq = ({bands, minDb, maxDb, bright, onGainLive, onGainCommit, onSetFreq, onRemoveBand}: {
+const ParametricEq = ({bands, minDb, maxDb, bright, onGainLive, onGainCommit, onSetFreq, onRemoveBand, onDragStart, onDragEnd}: {
   bands: PeqBand[]; minDb: number; maxDb: number; bright: string;
   onGainLive: (i: number, db: number) => void; onGainCommit: (i: number, db: number) => void;
   onSetFreq: (i: number, hz: number) => void; onRemoveBand: (i: number) => void;
+  onDragStart: () => void; onDragEnd: () => void;
 }) => {
   const [editing, setEditing] = useState<number | null>(null);
   return (
     <View style={eqS.panel}>
       <EqCurve bands={bands} minDb={minDb} maxDb={maxDb} bright={bright}/>
-      <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={eqS.bandsRow}>
+      {/* Rangée flex (toutes les bandes tiennent à l'écran) : pas de scroll
+          horizontal, donc aucun conflit de geste avec le réglage du gain. */}
+      <View style={eqS.bandsRow}>
         <View style={eqS.scale}>
           <Text style={eqS.scaleTxt}>+{maxDb}</Text>
           <Text style={eqS.scaleTxt}>0</Text>
@@ -367,9 +376,11 @@ const ParametricEq = ({bands, minDb, maxDb, bright, onGainLive, onGainCommit, on
             onLive={db => onGainLive(i, db)}
             onCommit={db => onGainCommit(i, db)}
             onEditFreq={() => setEditing(i)}
+            onDragStart={onDragStart}
+            onDragEnd={onDragEnd}
           />
         ))}
-      </ScrollView>
+      </View>
       <FreqEditModal
         visible={editing !== null}
         freq={editing !== null ? (bands[editing]?.freq ?? 1000) : 1000}
@@ -386,10 +397,10 @@ const eqS = StyleSheet.create({
   curveWrap: {position:'relative', overflow:'hidden', borderRadius:6, backgroundColor:'#ffffff08'},
   curveRow:  {flexDirection:'row', alignItems:'flex-end', height:'100%', opacity:0.55},
   zeroLine:  {position:'absolute', left:0, right:0, height:1, backgroundColor:'#ffffff22'},
-  bandsRow:  {flexDirection:'row', alignItems:'flex-end', marginTop:12, paddingRight:8},
-  scale:     {height:EQ_HEIGHT, justifyContent:'space-between', alignItems:'flex-end', marginBottom:20, marginRight:8, width:26},
+  bandsRow:  {flexDirection:'row', alignItems:'flex-end', marginTop:12},
+  scale:     {height:EQ_HEIGHT, justifyContent:'space-between', alignItems:'flex-end', marginBottom:20, marginRight:6, width:22},
   scaleTxt:  {fontSize:9, color:'#ffffff44'},
-  bandCol:   {width:48, alignItems:'center'},
+  bandCol:   {flex:1, alignItems:'center'},
   gain:      {fontSize:11, fontWeight:'600', marginBottom:6},
   slider:    {width:'100%', alignItems:'center', position:'relative'},
   sliderTrack:{position:'absolute', top:0, bottom:0, width:2, marginLeft:-1, left:'50%', backgroundColor:'#ffffff1f', borderRadius:1},
@@ -420,6 +431,7 @@ const PlayerScreen = ({track, onClose, queue, onRemoveFromQueue, eq}: {
   };
 }) => {
   const [sheetOpen, setSheetOpen] = useState(false);
+  const [eqDragging, setEqDragging] = useState(false); // fige le scroll pendant le réglage EQ
   const [addOpen,   setAddOpen]   = useState(false);
   const favorites = useFavorites();
   // Position en cours de glissement (ratio 0..1), null quand on ne touche pas la barre.
@@ -488,7 +500,7 @@ const PlayerScreen = ({track, onClose, queue, onRemoveFromQueue, eq}: {
         </TouchableOpacity>
       </View>
 
-      <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={pS.scroll}>
+      <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={pS.scroll} scrollEnabled={!eqDragging}>
         {/* Cover */}
         <View style={pS.coverWrap}>
           {coverUri ? (
@@ -583,6 +595,8 @@ const PlayerScreen = ({track, onClose, queue, onRemoveFromQueue, eq}: {
               onGainCommit={eq.onGainCommit}
               onSetFreq={eq.onSetFreq}
               onRemoveBand={eq.onRemoveBand}
+              onDragStart={() => setEqDragging(true)}
+              onDragEnd={() => setEqDragging(false)}
             />
           ) : (
             <Text style={[pS.timeText, {paddingVertical:12}]}>Égaliseur non disponible sur cet appareil.</Text>
