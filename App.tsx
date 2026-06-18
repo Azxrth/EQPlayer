@@ -27,6 +27,7 @@ const {useActiveTrack} = require('react-native-track-player') as {useActiveTrack
 import {setupPlayer, usePlayer, toPlayerTrack} from './src/usePlayer';
 import {usePlaylists, createPlaylist, renamePlaylist, deletePlaylist, toggleTrack, removeTrack, type Playlist} from './src/usePlaylists';
 import {useFavorites, toggleFavorite} from './src/useFavorites';
+import {useTrackMenu, openTrackMenu, closeTrackMenu} from './src/useTrackMenu';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import {peqGetInfo, peqConfigure, peqSetGain, peqSetEnabled, presetGainsFor, hzLabel, type PeqBand} from './src/peq';
 
@@ -760,7 +761,7 @@ const TrackRow = ({track, onPress, onDots, dotsIcon, dotsColor}: {track: any; on
       <Text style={S.rowSub}   numberOfLines={1}>{track.artist}</Text>
     </View>
     {track.format ? <Text style={S.rowFormat}>{track.format}</Text> : null}
-    <TouchableOpacity style={S.rowDots} onPress={onDots}>
+    <TouchableOpacity style={S.rowDots} onPress={onDots ?? (() => openTrackMenu(track))}>
       <MaterialCommunityIcons name={(dotsIcon ?? 'dots-vertical') as any} size={18} color={dotsColor ?? c.iconDim}/>
     </TouchableOpacity>
   </TouchableOpacity>
@@ -893,7 +894,10 @@ const EmptyState = ({msg, sub}: {msg: string; sub: string}) => {
 // ─── Library Page ─────────────────────────────────────────────────────────────
 type CatItem = {name: string; sub: string; id: string; artUri?: string; filter: (t: Track) => boolean};
 
-const LibraryPage = ({tracks, onTrackPress}: {tracks: Track[]; onTrackPress: (t: Track, queue?: Track[]) => void}) => {
+const LibraryPage = ({tracks, onTrackPress, navIntent, onNavConsumed}: {
+  tracks: Track[]; onTrackPress: (t: Track, queue?: Track[]) => void;
+  navIntent?: {type: 'album' | 'artist'; value: string} | null; onNavConsumed?: () => void;
+}) => {
   const [activeTab, setActiveTab] = useState(0);
   const [view, setView] = useState<ViewMode>('list');
   // Catégorie ouverte (drill-in) : la liste des morceaux qu'elle contient.
@@ -903,6 +907,18 @@ const LibraryPage = ({tracks, onTrackPress}: {tracks: Track[]; onTrackPress: (t:
 
   const selectTab = (i: number) => { setActiveTab(i); setDrill(null); };
   const openCategory = (item: CatItem) => setDrill({label: item.name, items: tracks.filter(item.filter)});
+
+  // Navigation venue du menu 3-points : ouvre l'album / l'artiste demandé.
+  useEffect(() => {
+    if (!navIntent) return;
+    const isAlbum = navIntent.type === 'album';
+    setActiveTab(isAlbum ? 2 : 1);
+    setDrill({
+      label: navIntent.value,
+      items: tracks.filter(t => (isAlbum ? t.album : t.artist) === navIntent.value),
+    });
+    onNavConsumed?.();
+  }, [navIntent, tracks, onNavConsumed]);
 
   // Rendu générique d'une catégorie (liste ou grille), entièrement cliquable.
   const renderCategory = (items: CatItem[], label: string, icon: string) => (
@@ -1442,6 +1458,157 @@ const MiniPlayer = ({track, onPress}: {track: Track|null; onPress: () => void}) 
   );
 };
 
+// ─── Menu 3-points d'une piste ────────────────────────────────────────────────
+const TrackInfoModal = ({track, onClose}: {track: any | null; onClose: () => void}) => {
+  const {setS} = useStyles();
+  if (!track) return null;
+  const quality = track.sampleRate
+    ? `${track.sampleRate / 1000} kHz${track.bitDepth ? ` / ${track.bitDepth} bits` : ''}`
+    : '—';
+  const rows: [string, string][] = [
+    ['Titre', track.title],
+    ['Artiste', track.artist],
+    ['Album', track.album],
+    ['Genre', track.genre || '—'],
+    ['Année', track.year || '—'],
+    ['Format', track.format || '—'],
+    ['Qualité', quality],
+    ['Durée', track.duration ? fmtTime(track.duration / 1000) : '—'],
+    ['Fichier', track.filePath || '—'],
+  ];
+  return (
+    <Modal visible transparent animationType="fade" onRequestClose={onClose}>
+      <TouchableOpacity style={setS.centerBackdrop} activeOpacity={1} onPress={onClose}>
+        <TouchableOpacity style={setS.dialog} activeOpacity={1}>
+          <Text style={setS.dialogTitle}>Infos de la piste</Text>
+          {rows.map(([k, v]) => (
+            <View key={k} style={tmS.infoRow}>
+              <Text style={tmS.infoKey}>{k}</Text>
+              <Text style={tmS.infoVal} numberOfLines={2}>{String(v)}</Text>
+            </View>
+          ))}
+          <View style={setS.dialogActions}>
+            <TouchableOpacity style={setS.dialogBtn} onPress={onClose}>
+              <Text style={setS.dialogBtnPrimary}>Fermer</Text>
+            </TouchableOpacity>
+          </View>
+        </TouchableOpacity>
+      </TouchableOpacity>
+    </Modal>
+  );
+};
+
+const SLEEP_OPTS = [
+  {label: 'Désactivée', min: 0},
+  {label: '15 minutes', min: 15},
+  {label: '30 minutes', min: 30},
+  {label: '45 minutes', min: 45},
+  {label: '1 heure', min: 60},
+];
+const SleepTimerModal = ({visible, current, onSelect, onClose}: {
+  visible: boolean; current: number; onSelect: (min: number) => void; onClose: () => void;
+}) => {
+  const {setS} = useStyles();
+  const c = useColors();
+  return (
+    <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
+      <TouchableOpacity style={setS.backdrop} activeOpacity={1} onPress={onClose}>
+        <View style={setS.sheet}>
+          <Text style={setS.sheetTitle}>Minuterie de veille</Text>
+          {SLEEP_OPTS.map(o => (
+            <TouchableOpacity key={o.min} style={setS.option} onPress={() => { onSelect(o.min); onClose(); }}>
+              <Text style={[setS.optionText, o.min === current && setS.optionTextActive]}>{o.label}</Text>
+              {o.min === current && <MaterialCommunityIcons name="check" size={18} color={c.accent}/>}
+            </TouchableOpacity>
+          ))}
+        </View>
+      </TouchableOpacity>
+    </Modal>
+  );
+};
+
+type TrackMenuHandlers = {
+  onClose: () => void;
+  onPlay: () => void; onPlayNext: () => void; onToggleFav: () => void; onAddPlaylist: () => void;
+  onOpenEq: () => void; onInfo: () => void; onGoAlbum: () => void; onGoArtist: () => void;
+  onSleep: () => void; onTheme: () => void; onDelete: () => void;
+};
+const TrackMenuSheet = ({track, isFav, h}: {track: any | null; isFav: boolean; h: TrackMenuHandlers}) => {
+  const {setS} = useStyles();
+  const c = useColors();
+  if (!track) return null;
+  const run = (fn: () => void) => { h.onClose(); fn(); };
+  const quick = [
+    {icon: 'play', label: 'Lire', color: c.text, onPress: h.onPlay},
+    {icon: isFav ? 'heart' : 'heart-outline', label: 'Favori', color: isFav ? '#ff4d6d' : c.text, onPress: h.onToggleFav},
+    {icon: 'playlist-plus', label: 'Playlist', color: c.text, onPress: h.onAddPlaylist},
+    {icon: 'tune-vertical', label: 'Égaliseur', color: c.text, onPress: h.onOpenEq},
+  ];
+  const items = [
+    {icon: 'playlist-play', label: 'Lire ensuite', onPress: h.onPlayNext},
+    {icon: 'information-outline', label: 'Infos de la piste', onPress: h.onInfo},
+    {icon: 'album', label: "Aller à l'album", onPress: h.onGoAlbum},
+    {icon: 'account', label: "Aller à l'artiste", onPress: h.onGoArtist},
+    {icon: 'timer-outline', label: 'Minuterie de veille', onPress: h.onSleep},
+    {icon: 'palette-outline', label: 'Thème', onPress: h.onTheme},
+    {icon: 'trash-can-outline', label: 'Supprimer la piste', onPress: h.onDelete, danger: true},
+  ];
+  return (
+    <Modal visible transparent animationType="slide" onRequestClose={h.onClose}>
+      <TouchableOpacity style={setS.backdrop} activeOpacity={1} onPress={h.onClose}>
+        <TouchableOpacity style={setS.sheet} activeOpacity={1}>
+          <View style={tmS.head}>
+            {track.artUri ? (
+              <Image source={{uri: track.artUri}} style={tmS.headCover} resizeMode="cover"/>
+            ) : (
+              <View style={[tmS.headCover, {backgroundColor: coverBg(track.genre)}]}>
+                <MaterialCommunityIcons name="music" size={20} color="#ffffff44"/>
+              </View>
+            )}
+            <View style={tmS.headMeta}>
+              <Text style={tmS.headTitle} numberOfLines={1}>{track.title}</Text>
+              <Text style={tmS.headSub} numberOfLines={1}>{track.artist}</Text>
+            </View>
+          </View>
+          <View style={tmS.quickRow}>
+            {quick.map((q, i) => (
+              <TouchableOpacity key={i} style={tmS.quick} onPress={() => run(q.onPress)}>
+                <View style={tmS.quickIcon}><MaterialCommunityIcons name={q.icon as any} size={22} color={q.color}/></View>
+                <Text style={tmS.quickLabel}>{q.label}</Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+          <View style={tmS.sep}/>
+          {items.map((it, i) => (
+            <TouchableOpacity key={i} style={tmS.row} onPress={() => run(it.onPress)}>
+              <MaterialCommunityIcons name={it.icon as any} size={20} color={it.danger ? '#ff4d6d' : c.textDim}/>
+              <Text style={[tmS.rowLabel, it.danger ? {color: '#ff4d6d'} : {color: c.text}]}>{it.label}</Text>
+            </TouchableOpacity>
+          ))}
+        </TouchableOpacity>
+      </TouchableOpacity>
+    </Modal>
+  );
+};
+
+const tmS = StyleSheet.create({
+  head:      {flexDirection: 'row', alignItems: 'center', gap: 12, paddingHorizontal: 20, paddingTop: 16, paddingBottom: 12},
+  headCover: {width: 44, height: 44, borderRadius: 6, alignItems: 'center', justifyContent: 'center'},
+  headMeta:  {flex: 1},
+  headTitle: {color: '#fff', fontSize: 15, fontWeight: '600'},
+  headSub:   {color: '#ffffff88', fontSize: 12, marginTop: 2},
+  quickRow:  {flexDirection: 'row', paddingHorizontal: 12, paddingBottom: 8},
+  quick:     {flex: 1, alignItems: 'center', paddingVertical: 8},
+  quickIcon: {width: 48, height: 48, borderRadius: 24, backgroundColor: '#ffffff14', alignItems: 'center', justifyContent: 'center', marginBottom: 6},
+  quickLabel:{color: '#ffffffcc', fontSize: 11},
+  sep:       {height: 0.5, backgroundColor: '#ffffff1a', marginVertical: 4, marginHorizontal: 16},
+  row:       {flexDirection: 'row', alignItems: 'center', gap: 16, paddingVertical: 14, paddingHorizontal: 20},
+  rowLabel:  {fontSize: 15},
+  infoRow:   {flexDirection: 'row', paddingVertical: 5},
+  infoKey:   {width: 78, color: '#ffffff77', fontSize: 13},
+  infoVal:   {flex: 1, color: '#fff', fontSize: 13},
+});
+
 // ─── App Root ─────────────────────────────────────────────────────────────────
 async function requestMusicPermission(): Promise<boolean> {
   if (Platform.OS !== 'android') return false;
@@ -1462,6 +1629,15 @@ export default function App() {
   const [currentTrack, setCurrentTrack] = useState<Track|null>(null);
   const [playerOpen,   setPlayerOpen]   = useState(false);
   const [eqOpen,       setEqOpen]       = useState(false);
+  // Menu 3-points : modales et navigation
+  const menuTrack = useTrackMenu();
+  const favoritesIds = useFavorites();
+  const [infoTrack,    setInfoTrack]    = useState<Track | null>(null);
+  const [sleepOpen,    setSleepOpen]    = useState(false);
+  const [sleepMin,     setSleepMin]     = useState(0);
+  const sleepTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [addPlTrackId, setAddPlTrackId] = useState<string | null>(null);
+  const [libNav,       setLibNav]       = useState<{type: 'album' | 'artist'; value: string} | null>(null);
   const [tracks,       setTracks]       = useState<Track[]>(DEMO_TRACKS);
   const [scanState,    setScanState]    = useState<'idle'|'scanning'|'done'|'denied'>('idle');
   const [scanCount,    setScanCount]    = useState(0);
@@ -1653,7 +1829,58 @@ export default function App() {
     {label:'Paramètres',   icon:'account-circle-outline'},
   ];
 
-  const {playTrack} = usePlayer();
+  const {playTrack, addNext} = usePlayer();
+
+  // Minuterie de veille : (re)programme une pause après N minutes (0 = off).
+  const applySleep = useCallback((min: number) => {
+    setSleepMin(min);
+    if (sleepTimerRef.current) clearTimeout(sleepTimerRef.current);
+    sleepTimerRef.current = null;
+    if (min > 0) {
+      sleepTimerRef.current = setTimeout(() => {
+        TrackPlayer.pause().catch(() => {});
+        setSleepMin(0);
+      }, min * 60 * 1000);
+    }
+  }, []);
+
+  // Bascule le thème (Sombre → Clair → Automatique → …)
+  const cycleTheme = useCallback(() => {
+    setTheme(prev => {
+      const next = THEME_OPTS[(THEME_OPTS.indexOf(prev) + 1) % THEME_OPTS.length];
+      AsyncStorage.setItem('pref.theme', next).catch(() => {});
+      return next;
+    });
+  }, []);
+
+  // Va à l'album / l'artiste de la piste (ferme le lecteur, ouvre la bibliothèque)
+  const navToCategory = useCallback((type: 'album' | 'artist', value: string) => {
+    setPlayerOpen(false);
+    setEqOpen(false);
+    setPage(0);
+    setLibNav({type, value});
+  }, []);
+
+  // Supprime définitivement le fichier de la piste (avec confirmation système)
+  const confirmDeleteTrack = useCallback((t: Track) => {
+    Alert.alert('Supprimer la piste', `Supprimer définitivement « ${t.title} » ?`, [
+      {text: 'Annuler', style: 'cancel'},
+      {text: 'Supprimer', style: 'destructive', onPress: async () => {
+        try {
+          const ok = await (MusicLibrary as any).deleteTrack?.(t.id);
+          if (ok) {
+            setTracks(prev => {
+              const next = prev.filter(x => x.id !== t.id);
+              AsyncStorage.setItem('cache.tracks', JSON.stringify(next)).catch(() => {});
+              return next;
+            });
+          }
+        } catch (e) {
+          Alert.alert('Suppression impossible', String((e as any)?.message ?? e));
+        }
+      }},
+    ]);
+  }, []);
 
   // Palette active selon la préférence de thème
   const scheme = useColorScheme();
@@ -1694,7 +1921,7 @@ export default function App() {
         </TouchableOpacity>
       )}
 
-      {page === 0 && <LibraryPage tracks={tracks} onTrackPress={openTrack}/>}
+      {page === 0 && <LibraryPage tracks={tracks} onTrackPress={openTrack} navIntent={libNav} onNavConsumed={() => setLibNav(null)}/>}
       {page === 1 && <FavoritesPage tracks={tracks} onTrackPress={openTrack}/>}
       {page === 2 && (
         <SettingsPage
@@ -1729,6 +1956,29 @@ export default function App() {
         eq={{range: peqRange, bands: eqBands, onGainLive, onGainCommit, onSetFreq, onAddBand, onRemoveBand, onReset: onResetBands}}
         bright={getPalette(currentTrack?.genre).bright}
       />
+
+      {/* Menu 3-points d'une piste + ses modales */}
+      <TrackMenuSheet
+        track={menuTrack}
+        isFav={menuTrack ? favoritesIds.includes(menuTrack.id) : false}
+        h={{
+          onClose: closeTrackMenu,
+          onPlay:        () => menuTrack && openTrack(menuTrack, tracks),
+          onPlayNext:    () => menuTrack && addNext(menuTrack),
+          onToggleFav:   () => menuTrack && toggleFavorite(menuTrack.id),
+          onAddPlaylist: () => menuTrack && setAddPlTrackId(menuTrack.id),
+          onOpenEq:      () => setEqOpen(true),
+          onInfo:        () => setInfoTrack(menuTrack),
+          onGoAlbum:     () => menuTrack && navToCategory('album', menuTrack.album),
+          onGoArtist:    () => menuTrack && navToCategory('artist', menuTrack.artist),
+          onSleep:       () => setSleepOpen(true),
+          onTheme:       cycleTheme,
+          onDelete:      () => menuTrack && confirmDeleteTrack(menuTrack),
+        }}
+      />
+      <TrackInfoModal track={infoTrack} onClose={() => setInfoTrack(null)}/>
+      <SleepTimerModal visible={sleepOpen} current={sleepMin} onSelect={applySleep} onClose={() => setSleepOpen(false)}/>
+      <AddToPlaylistSheet trackId={addPlTrackId} visible={!!addPlTrackId} onClose={() => setAddPlTrackId(null)}/>
     </SafeAreaView>
     </ThemeCtx.Provider>
   );

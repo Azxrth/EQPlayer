@@ -1,6 +1,8 @@
 package com.eqplayer
 
+import android.app.Activity
 import android.content.ContentUris
+import android.content.Intent
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.net.Uri
@@ -13,6 +15,44 @@ class MusicLibraryModule(reactContext: ReactApplicationContext) :
     ReactContextBaseJavaModule(reactContext) {
 
     override fun getName() = "MusicLibrary"
+
+    private var pendingDelete: Promise? = null
+    private val deleteReqCode = 7321
+
+    init {
+        // Récupère le résultat de la confirmation système de suppression.
+        reactContext.addActivityEventListener(object : BaseActivityEventListener() {
+            override fun onActivityResult(activity: Activity, requestCode: Int, resultCode: Int, data: Intent?) {
+                if (requestCode == deleteReqCode) {
+                    pendingDelete?.resolve(resultCode == Activity.RESULT_OK)
+                    pendingDelete = null
+                }
+            }
+        })
+    }
+
+    // Supprime le fichier audio via MediaStore. Sur Android 11+ l'OS affiche une
+    // boîte de confirmation système (createDeleteRequest) → résultat via l'activity.
+    @ReactMethod
+    fun deleteTrack(id: String, promise: Promise) {
+        try {
+            val resolver = reactApplicationContext.contentResolver
+            val uri = ContentUris.withAppendedId(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, id.toLong())
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                val activity = reactApplicationContext.currentActivity
+                    ?: return promise.reject("NO_ACTIVITY", "Activité indisponible")
+                val pi = MediaStore.createDeleteRequest(resolver, listOf(uri))
+                pendingDelete = promise
+                activity.startIntentSenderForResult(pi.intentSender, deleteReqCode, null, 0, 0, 0)
+            } else {
+                val n = resolver.delete(uri, null, null)
+                promise.resolve(n > 0)
+            }
+        } catch (e: Exception) {
+            pendingDelete = null
+            promise.reject("DELETE_ERROR", e.message, e)
+        }
+    }
 
     // Holder intermédiaire : on collecte les lignes du curseur puis on remplit
     // sampleRate/bitDepth en parallèle avant de construire le tableau JS.

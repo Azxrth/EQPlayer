@@ -193,6 +193,20 @@ export function usePlayer() {
     await TrackPlayer.play();
   }, []);
 
+  // Insère un morceau juste après le morceau courant (« Lire ensuite »).
+  // Si rien n'est chargé, démarre la lecture avec ce morceau seul.
+  const addNext = useCallback(async (track: any) => {
+    const queue = await TrackPlayer.getQueue();
+    if (queue.length === 0) {
+      await TrackPlayer.add([toPlayerTrack(track)]);
+      await TrackPlayer.play();
+      return;
+    }
+    const idx = (await TrackPlayer.getActiveTrackIndex()) ?? 0;
+    await TrackPlayer.add([toPlayerTrack(track)], idx + 1);
+    sourceQueue.splice(idx + 1, 0, track);
+  }, []);
+
   const togglePlay = useCallback(async () => {
     if (isPlaying) {
       await TrackPlayer.pause();
@@ -220,6 +234,7 @@ export function usePlayer() {
     activeTrack,
     playMode,
     playTrack,
+    addNext,
     togglePlay,
     skipNext,
     skipPrev,
