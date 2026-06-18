@@ -245,20 +245,52 @@ const PlayerScreen = ({track, onClose, queue, onRemoveFromQueue, eqInfo, eqLevel
 }) => {
   const [isFav,     setIsFav]     = useState(false);
   const [sheetOpen, setSheetOpen] = useState(false);
+  // Position en cours de glissement (ratio 0..1), null quand on ne touche pas la barre.
+  const [seekRatio, setSeekRatio] = useState<number | null>(null);
 
   // Vrais contrôles depuis usePlayer
   const {isPlaying, isLoading, progress, activeTrack, playMode, togglePlay, skipNext, skipPrev, seekTo, cyclePlayMode} = usePlayer();
 
+  // Largeur de la barre = largeur écran - paddings (24 de chaque côté).
+  const TRACK_W = width - 48;
+  // Le PanResponder est créé une fois : il lit la durée courante via un ref.
+  const durationRef = useRef(0);
+  durationRef.current = progress.duration;
+  const ratioFromX = (x: number) => Math.max(0, Math.min(1, x / TRACK_W));
+  const seekPan = useRef(
+    PanResponder.create({
+      onStartShouldSetPanResponder: () => true,
+      onMoveShouldSetPanResponder:  () => true,
+      onPanResponderGrant: e => setSeekRatio(ratioFromX(e.nativeEvent.locationX)),
+      onPanResponderMove:  e => setSeekRatio(ratioFromX(e.nativeEvent.locationX)),
+      onPanResponderRelease: e => {
+        const r = ratioFromX(e.nativeEvent.locationX);
+        seekTo(r * (durationRef.current || 0));
+        setSeekRatio(null);
+      },
+      onPanResponderTerminate: () => setSeekRatio(null),
+    }),
+  ).current;
+
+  // Pendant le glissement, on suit le doigt (seekRatio) ; sinon la position du player.
+  const livePct = progress.duration > 0 ? progress.position / progress.duration : 0;
+  const pct      = seekRatio !== null ? seekRatio : livePct;
+  const shownPos = seekRatio !== null ? seekRatio * progress.duration : progress.position;
+
   // Utilise le track actif du player si disponible, sinon celui passé en prop
   const displayTrack = activeTrack ?? track;
   const palette = getPalette(displayTrack?.genre ?? track.genre);
+  // L'objet track-player expose la pochette via `artwork` ; l'objet app via `artUri`.
+  const coverUri = (displayTrack as any)?.artwork ?? (displayTrack as any)?.artUri ?? track.artUri;
 
+  // 'one' = répète le titre (boucle + « 1 ») ; 'loop-once'/'loop' = boucle simple
+  // (le point sous l'icône distingue la répétition infinie) ; 'shuffle' = flèches croisées.
   const modeIcon = () => ({
-    'shuffle-variant': 'shuffle-variant',
-    repeat:            'repeat',
-    'repeat-once':     'repeat-once',
-    'arrow-right':     'arrow-right',
-  }[{order:'arrow-right', shuffle:'shuffle-variant', loop:'repeat', one:'repeat-once'}[playMode]] ?? 'arrow-right');
+    one:          'repeat-once',
+    'loop-once':  'repeat',
+    loop:         'repeat',
+    shuffle:      'shuffle-variant',
+  }[playMode] ?? 'repeat');
 
   return (
     <View style={[pS.root, {backgroundColor:palette.dark}]}>
@@ -280,8 +312,8 @@ const PlayerScreen = ({track, onClose, queue, onRemoveFromQueue, eqInfo, eqLevel
       <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={pS.scroll}>
         {/* Cover */}
         <View style={pS.coverWrap}>
-          {track.artUri ? (
-            <Image source={{uri: track.artUri}} style={pS.cover} resizeMode="cover"/>
+          {coverUri ? (
+            <Image source={{uri: coverUri}} style={pS.cover} resizeMode="cover"/>
           ) : (
             <View style={[pS.cover, {borderColor:palette.bright+'44', backgroundColor:palette.cover ?? '#ffffff0d'}]}>
               <MaterialCommunityIcons name="music" size={80} color={palette.bright+'88'}/>
@@ -307,24 +339,22 @@ const PlayerScreen = ({track, onClose, queue, onRemoveFromQueue, eqInfo, eqLevel
 
         {/* Progression */}
         <View style={pS.progressWrap}>
-          <TouchableOpacity
-            style={pS.progressTrack}
-            activeOpacity={1}
-            onPress={e => {
-              const ratio = e.nativeEvent.locationX / (width - 48);
-              seekTo(ratio * (progress.duration || 1));
-            }}>
-            <View style={[pS.progressFill, {
-              width: progress.duration > 0 ? `${(progress.position / progress.duration) * 100}%` : '0%',
-              backgroundColor: palette.bright,
-            }]}/>
-            <View style={[pS.progressThumb, {
-              left: progress.duration > 0 ? `${(progress.position / progress.duration) * 100}%` : '0%',
-              backgroundColor: palette.bright,
-            }]}/>
-          </TouchableOpacity>
+          {/* Zone tactile élargie (le track visuel ne fait que 3px) */}
+          <View style={pS.progressHit} {...seekPan.panHandlers}>
+            <View style={pS.progressTrack}>
+              <View style={[pS.progressFill, {
+                width: `${pct * 100}%`,
+                backgroundColor: palette.bright,
+              }]}/>
+              <View style={[pS.progressThumb, {
+                left: `${pct * 100}%`,
+                backgroundColor: palette.bright,
+                transform: seekRatio !== null ? [{scale: 1.6}] : [{scale: 1}],
+              }]}/>
+            </View>
+          </View>
           <View style={pS.progressTimes}>
-            <Text style={pS.timeText}>{fmtTime(progress.position)}</Text>
+            <Text style={pS.timeText}>{fmtTime(shownPos)}</Text>
             <Text style={pS.timeText}>{fmtTime(progress.duration)}</Text>
           </View>
         </View>
@@ -333,7 +363,7 @@ const PlayerScreen = ({track, onClose, queue, onRemoveFromQueue, eqInfo, eqLevel
         <View style={pS.controls}>
           <TouchableOpacity style={[pS.ctrlBtn, pS.ctrlBtnGlass]} onPress={cyclePlayMode}>
             <MaterialCommunityIcons name={modeIcon() as any} size={22} color="#fff"/>
-            {playMode !== 'order' && <View style={[pS.modeDot, {backgroundColor:palette.bright}]}/>}
+            {playMode === 'loop' && <View style={[pS.modeDot, {backgroundColor:palette.bright}]}/>}
           </TouchableOpacity>
           <TouchableOpacity style={[pS.ctrlBtn, pS.ctrlBtnGlass]} onPress={skipPrev}>
             <MaterialCommunityIcons name="skip-previous" size={22} color="#fff"/>
@@ -438,7 +468,8 @@ const pS = StyleSheet.create({
   titleActions:  {flexDirection:'row', gap:4},
   titleBtn:      {width:40, height:40, alignItems:'center', justifyContent:'center'},
   progressWrap:  {paddingHorizontal:24, marginBottom:24},
-  progressTrack: {height:3, backgroundColor:'#ffffff22', borderRadius:2, marginBottom:8, position:'relative'},
+  progressHit:   {paddingVertical:14, justifyContent:'center'},
+  progressTrack: {height:3, backgroundColor:'#ffffff22', borderRadius:2, position:'relative'},
   progressFill:  {height:3, borderRadius:2, position:'absolute', left:0, top:0},
   progressThumb: {width:12, height:12, borderRadius:6, position:'absolute', top:-4.5, marginLeft:-6},
   progressTimes: {flexDirection:'row', justifyContent:'space-between'},
@@ -1136,7 +1167,7 @@ const makeS = (c: Colors) => StyleSheet.create({
   headerBtn:    {paddingHorizontal:8, height:36, alignItems:'center', justifyContent:'center'},
   headerBtnText:{color:c.textDim, fontSize:13},
 
-  tabsScroll:{borderBottomWidth:0.5, borderBottomColor:c.border},
+  tabsScroll:{flexGrow:0, borderBottomWidth:0.5, borderBottomColor:c.border},
   tabs:      {flexDirection:'row'},
   tab:       {width:46, alignItems:'center', paddingVertical:12, position:'relative'},
   tabLine:   {position:'absolute', bottom:0, left:'15%', right:'15%', height:2, backgroundColor:c.text, borderRadius:1},
