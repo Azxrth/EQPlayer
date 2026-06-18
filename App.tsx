@@ -463,7 +463,7 @@ const EqualizerScreen = ({visible, onClose, eq, bright}: {
 };
 
 const eqScrS = StyleSheet.create({
-  root:     {position:'absolute', top:0, left:0, right:0, bottom:0, backgroundColor:'#0a0a0d', zIndex:110},
+  root:     {position:'absolute', top:0, left:0, right:0, bottom:0, backgroundColor:'#0a0a0d'},
   header:   {flexDirection:'row', alignItems:'center', paddingTop:52, paddingHorizontal:12, paddingBottom:12},
   hBtn:     {padding:6},
   title:    {flex:1, color:'#fff', fontSize:20, fontWeight:'700', marginLeft:4},
@@ -486,7 +486,6 @@ const PlayerScreen = ({track, onClose, queue, onRemoveFromQueue, eq, onOpenEq}: 
   track: Track; onClose: () => void; queue: Track[]; onRemoveFromQueue: (id: string) => void;
   eq: EqApi; onOpenEq: () => void;
 }) => {
-  const [sheetOpen, setSheetOpen] = useState(false);
   const [addOpen,   setAddOpen]   = useState(false);
   const favorites = useFavorites();
   // Position en cours de glissement (ratio 0..1), null quand on ne touche pas la barre.
@@ -550,7 +549,7 @@ const PlayerScreen = ({track, onClose, queue, onRemoveFromQueue, eq, onOpenEq}: 
           <MaterialCommunityIcons name="chevron-down" size={28} color="#fff"/>
         </TouchableOpacity>
         <Text style={pS.topTitle}>En lecture</Text>
-        <TouchableOpacity style={pS.topBtn} onPress={() => setSheetOpen(true)}>
+        <TouchableOpacity style={pS.topBtn} onPress={() => openTrackMenu(track)}>
           <MaterialCommunityIcons name="dots-vertical" size={24} color="#fff"/>
         </TouchableOpacity>
       </View>
@@ -669,27 +668,6 @@ const PlayerScreen = ({track, onClose, queue, onRemoveFromQueue, eq, onOpenEq}: 
         </View>
       </ScrollView>
 
-      {/* Bottom sheet */}
-      {sheetOpen && (
-        <TouchableOpacity style={pS.overlay} onPress={() => setSheetOpen(false)} activeOpacity={1}>
-          <View style={pS.sheet}>
-            {[
-              {icon:'album',              label:"Voir l'album"},
-              {icon:'account',            label:"Voir l'artiste"},
-              {icon:'share-variant',      label:'Partager'},
-              {icon:'equalizer',          label:"Modifier l'EQ"},
-              {icon:'download',           label:'Télécharger'},
-              {icon:'thumb-down-outline', label:'Ne plus recommander'},
-            ].map((item, i) => (
-              <TouchableOpacity key={i} style={pS.sheetRow} onPress={() => setSheetOpen(false)}>
-                <MaterialCommunityIcons name={item.icon as any} size={20} color="#fff"/>
-                <Text style={pS.sheetLabel}>{item.label}</Text>
-              </TouchableOpacity>
-            ))}
-          </View>
-        </TouchableOpacity>
-      )}
-
       <AddToPlaylistSheet
         trackId={(displayTrack as any)?.id ?? null}
         visible={addOpen}
@@ -699,7 +677,7 @@ const PlayerScreen = ({track, onClose, queue, onRemoveFromQueue, eq, onOpenEq}: 
 };
 
 const pS = StyleSheet.create({
-  root:          {flex:1, position:'absolute', inset:0, zIndex:100},
+  root:          {flex:1, position:'absolute', inset:0},
   blob1:         {position:'absolute', top:-100, right:-100, width:300, height:300, borderRadius:150},
   blob2:         {position:'absolute', bottom:100, left:-80, width:250, height:250, borderRadius:125},
   topBar:        {flexDirection:'row', alignItems:'center', justifyContent:'space-between', paddingHorizontal:16, paddingTop:52, paddingBottom:8},
