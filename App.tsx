@@ -1323,13 +1323,36 @@ export default function App() {
       setTracks(result);
       setScanCount(result.length);
       setScanState('done');
+      // Cache la bibliothèque pour un démarrage instantané au prochain lancement.
+      AsyncStorage.setItem('cache.tracks', JSON.stringify(result)).catch(() => {});
     } catch (e) {
       console.warn('Scan error:', e);
       setScanState('done');
     }
   }, []);
 
-  useEffect(() => { scan(); }, [scan]);
+  // Au démarrage : on charge la dernière bibliothèque connue (instantané, sans
+  // flash des démos) et on ne (re)scanne QUE si aucun cache. Le re-scan reste
+  // accessible à la demande via les Paramètres (bouton « Scanner »).
+  useEffect(() => {
+    (async () => {
+      try {
+        const cached = await AsyncStorage.getItem('cache.tracks');
+        if (cached) {
+          const list = JSON.parse(cached) as Track[];
+          if (list.length) {
+            setTracks(list);
+            setScanCount(list.length);
+            setScanState('done');
+            return;
+          }
+        }
+      } catch {
+        // cache illisible → on retombe sur un scan
+      }
+      scan();
+    })();
+  }, [scan]);
 
   const NAV = [
     {label:'Bibliothèque', icon:'disc'},
