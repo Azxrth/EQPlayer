@@ -1,4 +1,4 @@
-import {useEffect, useState, useCallback} from 'react';
+import {useEffect, useState} from 'react';
 import TrackPlayer, {
   Capability,
   AppKilledPlaybackBehavior,
@@ -10,7 +10,7 @@ import TrackPlayer, {
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const RNTP = require('react-native-track-player');
 const usePlaybackState: () => {state: State | undefined} = RNTP.usePlaybackState;
-const useProgress: (interval?: number) => {position: number; duration: number; buffered: number} = RNTP.useProgress;
+export const useProgress: (interval?: number) => {position: number; duration: number; buffered: number} = RNTP.useProgress;
 const useActiveTrack: () => import('react-native-track-player').Track | undefined = RNTP.useActiveTrack;
 
 // Modes de lecture (mutuellement exclusifs, sur le même bouton) :
@@ -151,13 +151,66 @@ export function toPlayerTrack(t: any) {
   };
 }
 
+// ─── Contrôles (fonctions module, sans état React) ───────────────────────────
+// Sorties du hook pour qu'un composant puisse les appeler SANS s'abonner à la
+// progression/à l'état (donc sans re-render 2×/s). usePlayer() ne fait plus que
+// exposer l'état réactif nécessaire à l'affichage.
+
+// Joue un morceau (et charge sa file depuis la bibliothèque)
+export async function playTrack(track: any, queue: any[]) {
+  await TrackPlayer.reset();
+  const clickedIdx = queue.findIndex(t => t.id === track.id);
+  const ordered = clickedIdx >= 0
+    ? [...queue.slice(clickedIdx), ...queue.slice(0, clickedIdx)]
+    : [track, ...queue];
+  sourceQueue = ordered;
+  loopOncePlayed = false;
+  const toAdd = currentMode === 'shuffle'
+    ? [ordered[0], ...shuffled(ordered.slice(1))]
+    : ordered;
+  await TrackPlayer.add(toAdd.map(toPlayerTrack));
+  await TrackPlayer.setRepeatMode(repeatModeFor(currentMode));
+  await TrackPlayer.play();
+}
+
+// Insère un morceau juste après le morceau courant (« Lire ensuite »).
+export async function addNext(track: any) {
+  const queue = await TrackPlayer.getQueue();
+  if (queue.length === 0) {
+    await TrackPlayer.add([toPlayerTrack(track)]);
+    await TrackPlayer.play();
+    return;
+  }
+  const idx = (await TrackPlayer.getActiveTrackIndex()) ?? 0;
+  await TrackPlayer.add([toPlayerTrack(track)], idx + 1);
+  sourceQueue.splice(idx + 1, 0, track);
+}
+
+export async function togglePlay() {
+  const {state} = await TrackPlayer.getPlaybackState();
+  if (state === State.Playing) await TrackPlayer.pause();
+  else await TrackPlayer.play();
+}
+
+export const skipNext = () => { TrackPlayer.skipToNext().catch(() => {}); };
+export const skipPrev = () => { TrackPlayer.skipToPrevious().catch(() => {}); };
+export const seekTo   = (pos: number) => { TrackPlayer.seekTo(pos); };
+
+export async function cyclePlayMode() {
+  const prev = currentMode;
+  const next = MODE_CYCLE[(MODE_CYCLE.indexOf(prev) + 1) % MODE_CYCLE.length];
+  currentMode = next;
+  notifyMode();
+  await applyMode(next, prev);
+}
+
+// Hook réactif léger : état d'affichage seulement (PAS la progression, qui
+// changerait 2×/s ; voir useProgress, à utiliser dans un sous-composant dédié).
 export function usePlayer() {
   const playbackState = usePlaybackState();
-  const progress      = useProgress(500);
   const activeTrack   = useActiveTrack();
   const [playMode, setPlayMode] = useState<PlayMode>(currentMode);
 
-  // Abonnement au mode partagé pour rester synchro entre instances du hook.
   useEffect(() => {
     const sub = (m: PlayMode) => setPlayMode(m);
     modeSubscribers.add(sub);
@@ -169,68 +222,9 @@ export function usePlayer() {
   const isLoading = playbackState.state === State.Loading ||
                     playbackState.state === State.Buffering;
 
-  // Joue un morceau (et charge sa file depuis la bibliothèque)
-  const playTrack = useCallback(async (track: any, queue: any[]) => {
-    await TrackPlayer.reset();
-
-    // Met le morceau cliqué en premier, suivi du reste de la file
-    const clickedIdx = queue.findIndex(t => t.id === track.id);
-    const ordered = clickedIdx >= 0
-      ? [...queue.slice(clickedIdx), ...queue.slice(0, clickedIdx)]
-      : [track, ...queue];
-
-    // Ordre canonique conservé pour pouvoir y revenir depuis le mode shuffle.
-    sourceQueue = ordered;
-    loopOncePlayed = false; // nouvelle file : la répétition unique est ré-armée
-
-    // En shuffle, on garde le morceau cliqué en tête et on mélange le reste.
-    const toAdd = currentMode === 'shuffle'
-      ? [ordered[0], ...shuffled(ordered.slice(1))]
-      : ordered;
-
-    await TrackPlayer.add(toAdd.map(toPlayerTrack));
-    await TrackPlayer.setRepeatMode(repeatModeFor(currentMode));
-    await TrackPlayer.play();
-  }, []);
-
-  // Insère un morceau juste après le morceau courant (« Lire ensuite »).
-  // Si rien n'est chargé, démarre la lecture avec ce morceau seul.
-  const addNext = useCallback(async (track: any) => {
-    const queue = await TrackPlayer.getQueue();
-    if (queue.length === 0) {
-      await TrackPlayer.add([toPlayerTrack(track)]);
-      await TrackPlayer.play();
-      return;
-    }
-    const idx = (await TrackPlayer.getActiveTrackIndex()) ?? 0;
-    await TrackPlayer.add([toPlayerTrack(track)], idx + 1);
-    sourceQueue.splice(idx + 1, 0, track);
-  }, []);
-
-  const togglePlay = useCallback(async () => {
-    if (isPlaying) {
-      await TrackPlayer.pause();
-    } else {
-      await TrackPlayer.play();
-    }
-  }, [isPlaying]);
-
-  const skipNext = useCallback(() => TrackPlayer.skipToNext().catch(() => {}), []);
-  const skipPrev = useCallback(() => TrackPlayer.skipToPrevious().catch(() => {}), []);
-  const seekTo   = useCallback((pos: number) => TrackPlayer.seekTo(pos), []);
-
-  const cyclePlayMode = useCallback(async () => {
-    const prev = currentMode;
-    const next = MODE_CYCLE[(MODE_CYCLE.indexOf(prev) + 1) % MODE_CYCLE.length];
-    currentMode = next;
-    notifyMode();
-    await applyMode(next, prev);
-  }, []);
-
   return {
     isPlaying,
     isLoading,
-    progress,
     activeTrack,
     playMode,
     playTrack,

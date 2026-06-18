@@ -1,4 +1,4 @@
-import React, {useState, useRef, useEffect, useCallback, useContext} from 'react';
+import React, {useState, useRef, useEffect, useCallback, useContext, useMemo} from 'react';
 import {
   View,
   Text,
@@ -24,7 +24,7 @@ import MaterialCommunityIcons from 'react-native-vector-icons/MaterialCommunityI
 import TrackPlayer from 'react-native-track-player';
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const {useActiveTrack} = require('react-native-track-player') as {useActiveTrack: () => import('react-native-track-player').Track | undefined};
-import {setupPlayer, usePlayer, toPlayerTrack} from './src/usePlayer';
+import {setupPlayer, usePlayer, useProgress, playTrack, addNext, seekTo} from './src/usePlayer';
 import {usePlaylists, createPlaylist, renamePlaylist, deletePlaylist, toggleTrack, removeTrack, type Playlist} from './src/usePlaylists';
 import {useFavorites, toggleFavorite} from './src/useFavorites';
 import {useTrackMenu, openTrackMenu, closeTrackMenu} from './src/useTrackMenu';
@@ -481,6 +481,52 @@ function fmtTime(sec: number): string {
   return `${m}:${s.toString().padStart(2, '0')}`;
 }
 
+// Barre de progression isolée : SEUL ce composant s'abonne à la progression
+// (re-render 2×/s), donc le reste du lecteur ne se re-rend pas à chaque tick.
+const PlayerProgress = ({bright}: {bright: string}) => {
+  const progress = useProgress(500);
+  const [seekRatio, setSeekRatio] = useState<number | null>(null);
+  const TRACK_W = width - 48;
+  const durationRef = useRef(0);
+  durationRef.current = progress.duration;
+  const ratioFromX = (x: number) => Math.max(0, Math.min(1, x / TRACK_W));
+  const seekPan = useRef(
+    PanResponder.create({
+      onStartShouldSetPanResponder: () => true,
+      onMoveShouldSetPanResponder:  () => true,
+      onPanResponderGrant: e => setSeekRatio(ratioFromX(e.nativeEvent.locationX)),
+      onPanResponderMove:  e => setSeekRatio(ratioFromX(e.nativeEvent.locationX)),
+      onPanResponderRelease: e => {
+        const r = ratioFromX(e.nativeEvent.locationX);
+        seekTo(r * (durationRef.current || 0));
+        setSeekRatio(null);
+      },
+      onPanResponderTerminate: () => setSeekRatio(null),
+    }),
+  ).current;
+  const livePct  = progress.duration > 0 ? progress.position / progress.duration : 0;
+  const pct      = seekRatio !== null ? seekRatio : livePct;
+  const shownPos = seekRatio !== null ? seekRatio * progress.duration : progress.position;
+  return (
+    <View style={pS.progressWrap}>
+      <View style={pS.progressHit} {...seekPan.panHandlers}>
+        <View style={pS.progressTrack}>
+          <View style={[pS.progressFill, {width: `${pct * 100}%`, backgroundColor: bright}]}/>
+          <View style={[pS.progressThumb, {
+            left: `${pct * 100}%`,
+            backgroundColor: bright,
+            transform: seekRatio !== null ? [{scale: 1.6}] : [{scale: 1}],
+          }]}/>
+        </View>
+      </View>
+      <View style={pS.progressTimes}>
+        <Text style={pS.timeText}>{fmtTime(shownPos)}</Text>
+        <Text style={pS.timeText}>{fmtTime(progress.duration)}</Text>
+      </View>
+    </View>
+  );
+};
+
 // ─── Player ───────────────────────────────────────────────────────────────────
 const PlayerScreen = ({track, onClose, eq, onOpenEq}: {
   track: Track; onClose: () => void;
@@ -488,11 +534,9 @@ const PlayerScreen = ({track, onClose, eq, onOpenEq}: {
 }) => {
   const [addOpen,   setAddOpen]   = useState(false);
   const favorites = useFavorites();
-  // Position en cours de glissement (ratio 0..1), null quand on ne touche pas la barre.
-  const [seekRatio, setSeekRatio] = useState<number | null>(null);
 
-  // Vrais contrôles depuis usePlayer
-  const {isPlaying, isLoading, progress, activeTrack, playMode, togglePlay, skipNext, skipPrev, seekTo, cyclePlayMode} = usePlayer();
+  // Contrôles + état d'affichage (la progression est gérée par <PlayerProgress>)
+  const {isPlaying, isLoading, activeTrack, playMode, togglePlay, skipNext, skipPrev, cyclePlayMode} = usePlayer();
 
   // File d'attente réelle (morceaux à venir), rafraîchie quand le morceau change.
   const [upNext, setUpNext] = useState<any[]>([]);
@@ -517,32 +561,6 @@ const PlayerScreen = ({track, onClose, eq, onOpenEq}: {
     await TrackPlayer.remove([index]).catch(() => {});
     refreshQueue();
   }, [refreshQueue]);
-
-  // Largeur de la barre = largeur écran - paddings (24 de chaque côté).
-  const TRACK_W = width - 48;
-  // Le PanResponder est créé une fois : il lit la durée courante via un ref.
-  const durationRef = useRef(0);
-  durationRef.current = progress.duration;
-  const ratioFromX = (x: number) => Math.max(0, Math.min(1, x / TRACK_W));
-  const seekPan = useRef(
-    PanResponder.create({
-      onStartShouldSetPanResponder: () => true,
-      onMoveShouldSetPanResponder:  () => true,
-      onPanResponderGrant: e => setSeekRatio(ratioFromX(e.nativeEvent.locationX)),
-      onPanResponderMove:  e => setSeekRatio(ratioFromX(e.nativeEvent.locationX)),
-      onPanResponderRelease: e => {
-        const r = ratioFromX(e.nativeEvent.locationX);
-        seekTo(r * (durationRef.current || 0));
-        setSeekRatio(null);
-      },
-      onPanResponderTerminate: () => setSeekRatio(null),
-    }),
-  ).current;
-
-  // Pendant le glissement, on suit le doigt (seekRatio) ; sinon la position du player.
-  const livePct = progress.duration > 0 ? progress.position / progress.duration : 0;
-  const pct      = seekRatio !== null ? seekRatio : livePct;
-  const shownPos = seekRatio !== null ? seekRatio * progress.duration : progress.position;
 
   // Utilise le track actif du player si disponible, sinon celui passé en prop
   const displayTrack = activeTrack ?? track;
@@ -606,27 +624,8 @@ const PlayerScreen = ({track, onClose, eq, onOpenEq}: {
           </View>
         </View>
 
-        {/* Progression */}
-        <View style={pS.progressWrap}>
-          {/* Zone tactile élargie (le track visuel ne fait que 3px) */}
-          <View style={pS.progressHit} {...seekPan.panHandlers}>
-            <View style={pS.progressTrack}>
-              <View style={[pS.progressFill, {
-                width: `${pct * 100}%`,
-                backgroundColor: palette.bright,
-              }]}/>
-              <View style={[pS.progressThumb, {
-                left: `${pct * 100}%`,
-                backgroundColor: palette.bright,
-                transform: seekRatio !== null ? [{scale: 1.6}] : [{scale: 1}],
-              }]}/>
-            </View>
-          </View>
-          <View style={pS.progressTimes}>
-            <Text style={pS.timeText}>{fmtTime(shownPos)}</Text>
-            <Text style={pS.timeText}>{fmtTime(progress.duration)}</Text>
-          </View>
-        </View>
+        {/* Progression (composant isolé : ne re-rend pas le reste du lecteur) */}
+        <PlayerProgress bright={palette.bright}/>
 
         {/* Contrôles */}
         <View style={pS.controls}>
@@ -916,6 +915,21 @@ const LibraryPage = ({tracks, onTrackPress, navIntent, onNavConsumed}: {
   const selectTab = (i: number) => { setActiveTab(i); setDrill(null); };
   const openCategory = (item: CatItem) => setDrill({label: item.name, items: tracks.filter(item.filter)});
 
+  // Comptages par catégorie en UNE passe (au lieu de O(catégories × titres) à chaque rendu).
+  const counts = useMemo(() => {
+    const artist = new Map<string, number>();
+    const genre  = new Map<string, number>();
+    const year   = new Map<string, number>();
+    const format = new Map<string, number>();
+    for (const t of tracks) {
+      artist.set(t.artist, (artist.get(t.artist) ?? 0) + 1);
+      if (t.genre)  genre.set(t.genre,   (genre.get(t.genre) ?? 0) + 1);
+      if (t.year)   year.set(t.year,     (year.get(t.year) ?? 0) + 1);
+      if (t.format) format.set(t.format, (format.get(t.format) ?? 0) + 1);
+    }
+    return {artist, genre, year, format};
+  }, [tracks]);
+
   // Navigation venue du menu 3-points : ouvre l'album / l'artiste demandé.
   useEffect(() => {
     if (!navIntent) return;
@@ -976,9 +990,10 @@ const LibraryPage = ({tracks, onTrackPress, navIntent, onNavConsumed}: {
           : <FlatList
               data={tracks}
               keyExtractor={i=>i.id}
-              initialNumToRender={20}
-              maxToRenderPerBatch={20}
-              windowSize={10}
+              initialNumToRender={14}
+              maxToRenderPerBatch={12}
+              windowSize={7}
+              removeClippedSubviews
               renderItem={({item}) => <TrackRow track={item} onPress={() => onTrackPress(item, tracks)}/>}
             />
         }
@@ -986,8 +1001,8 @@ const LibraryPage = ({tracks, onTrackPress, navIntent, onNavConsumed}: {
     );
     // Artistes
     if (activeTab === 1) {
-      const items: CatItem[] = [...new Set(tracks.map(t=>t.artist))].sort()
-        .map(a => ({name:a, id:'artist:'+a, sub:tracks.filter(t=>t.artist===a).length+' pistes', filter:(t:Track)=>t.artist===a}));
+      const items: CatItem[] = [...counts.artist.keys()].sort()
+        .map(a => ({name:a, id:'artist:'+a, sub:counts.artist.get(a)+' pistes', filter:(t:Track)=>t.artist===a}));
       return renderCategory(items, 'artistes', 'account');
     }
     // Albums
@@ -1001,8 +1016,8 @@ const LibraryPage = ({tracks, onTrackPress, navIntent, onNavConsumed}: {
     }
     // Genres
     if (activeTab === 3) {
-      const items: CatItem[] = [...new Set(tracks.map(t=>t.genre).filter(Boolean))].sort()
-        .map(g => ({name:g, id:'genre:'+g, sub:tracks.filter(t=>t.genre===g).length+' pistes', filter:(t:Track)=>t.genre===g}));
+      const items: CatItem[] = [...counts.genre.keys()].sort()
+        .map(g => ({name:g, id:'genre:'+g, sub:counts.genre.get(g)+' pistes', filter:(t:Track)=>t.genre===g}));
       return renderCategory(items, 'genres', 'music-circle-outline');
     }
     // Dossiers
@@ -1013,8 +1028,8 @@ const LibraryPage = ({tracks, onTrackPress, navIntent, onNavConsumed}: {
     }
     // Années
     if (activeTab === 5) {
-      const items: CatItem[] = [...new Set(tracks.map(t=>t.year).filter(Boolean))].sort((a,b)=>Number(b)-Number(a))
-        .map(y => ({name:y, id:'year:'+y, sub:tracks.filter(t=>t.year===y).length+' pistes', filter:(t:Track)=>t.year===y}));
+      const items: CatItem[] = [...counts.year.keys()].sort((a,b)=>Number(b)-Number(a))
+        .map(y => ({name:y, id:'year:'+y, sub:counts.year.get(y)+' pistes', filter:(t:Track)=>t.year===y}));
       return renderCategory(items, 'annees', 'calendar-outline');
     }
     // Sampling — regroupement par qualité audio (taux d'échantillonnage / DSD)
@@ -1034,8 +1049,8 @@ const LibraryPage = ({tracks, onTrackPress, navIntent, onNavConsumed}: {
     }
     // Format
     if (activeTab === 7) {
-      const items: CatItem[] = [...new Set(tracks.map(t=>t.format).filter(Boolean))].sort()
-        .map(f => ({name:f, id:'fmt:'+f, sub:tracks.filter(t=>t.format===f).length+' pistes', filter:(t:Track)=>t.format===f}));
+      const items: CatItem[] = [...counts.format.keys()].sort()
+        .map(f => ({name:f, id:'fmt:'+f, sub:counts.format.get(f)+' pistes', filter:(t:Track)=>t.format===f}));
       return renderCategory(items, 'formats', 'file-music-outline');
     }
     return null;
@@ -1837,8 +1852,6 @@ export default function App() {
     {label:'Paramètres',   icon:'account-circle-outline'},
   ];
 
-  const {playTrack, addNext} = usePlayer();
-
   // Minuterie de veille : (re)programme une pause après N minutes (0 = off).
   const applySleep = useCallback((min: number) => {
     setSleepMin(min);
@@ -1902,7 +1915,7 @@ export default function App() {
     setPlayerOpen(true);
     // File = la liste fournie (catégorie/playlist) ou toute la bibliothèque.
     await playTrack(t, queue ?? tracks);
-  }, [tracks, playTrack]);
+  }, [tracks]);
 
   return (
     <ThemeCtx.Provider value={colors}>
