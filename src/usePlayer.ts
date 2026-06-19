@@ -1,4 +1,4 @@
-import {useEffect, useState} from 'react';
+import {useEffect, useReducer, useState} from 'react';
 import TrackPlayer, {
   Capability,
   AppKilledPlaybackBehavior,
@@ -28,7 +28,17 @@ const MODE_CYCLE: PlayMode[] = ['loop-once', 'loop', 'one', 'shuffle'];
 // niveau module pour que toutes les instances du hook (PlayerScreen, MiniPlayer…)
 // restent synchronisées, et pour que le handler de fin de file puisse le lire.
 let currentMode: PlayMode = 'loop-once';
-let sourceQueue: any[] = [];        // ordre canonique de la file (objets app)
+// sourceQueue = ordre de lecture COMPLET (objets app), figé au lancement. C'est
+// notre source de vérité ; on ne donne au moteur audio qu'une FENÊTRE de cette
+// liste (le morceau courant + quelques suivants), qu'on rallonge au fil de la
+// lecture. Ainsi l'ajout au player reste minuscule quelle que soit la taille de
+// la biblio (1867 titres) → démarrage et pause/play instantanés sur le JM21.
+let sourceQueue: any[] = [];
+let windowLoaded = 0;               // nb de pistes de sourceQueue déjà dans le player
+let extending = false;              // anti-réentrance de l'extension de fenêtre
+const WINDOW_INITIAL = 50;          // pistes chargées d'avance au lancement
+const WINDOW_AHEAD = 20;            // on rallonge quand il reste moins que ça devant
+const WINDOW_BATCH = 50;            // taille d'un rallongement
 let loopOncePlayed = false;         // a-t-on déjà fait la répétition unique en 'loop-once' ?
 const modeSubscribers = new Set<(m: PlayMode) => void>();
 function notifyMode() {
@@ -45,11 +55,28 @@ function repeatModeFor(mode: PlayMode): RepeatMode {
 
 let playerReady = false;
 
+// Dernier état de lecture connu (mis à jour par l'écouteur Event.PlaybackState).
+// Évite à togglePlay un aller-retour getPlaybackState() avant d'agir.
+let lastPlaybackState: State | undefined;
+
+// Retour visuel OPTIMISTE de pause/play : on bascule l'icône affichée dès le
+// toucher, sans attendre l'événement natif (qui peut tarder quand le thread de
+// track-player est chargé). Réconcilié dès que le natif rejoint l'état visé.
+let optimisticPlaying: boolean | null = null;
+const optimisticSubs = new Set<() => void>();
+function setOptimistic(v: boolean | null) {
+  if (optimisticPlaying === v) return;
+  optimisticPlaying = v;
+  optimisticSubs.forEach(fn => fn());
+}
+
 export async function setupPlayer() {
   if (playerReady) return;
-  await TrackPlayer.setupPlayer({
-    maxCacheSize: 1024 * 5, // 5 MB cache
-  });
+  // Pas de cache : on lit des fichiers 100% locaux (content://media/...).
+  // maxCacheSize active un CacheDataSource pensé pour le streaming réseau ;
+  // sur des fichiers locaux il ajoute une couche de lecture/copie qui peut
+  // bloquer le lecteur en « Buffering » plusieurs secondes avant de démarrer.
+  await TrackPlayer.setupPlayer();
   await TrackPlayer.updateOptions({
     android: {
       appKilledPlaybackBehavior: AppKilledPlaybackBehavior.StopPlaybackAndRemoveNotification,
@@ -73,6 +100,10 @@ export async function setupPlayer() {
 
   // En mode 'loop-once', RepeatMode.Off laisse la file s'arrêter à la fin :
   // on la rejoue alors une seule fois depuis le début, puis on la laisse s'arrêter.
+  TrackPlayer.addEventListener(Event.PlaybackState, (e: {state: State}) => {
+    lastPlaybackState = e.state;
+  });
+
   TrackPlayer.addEventListener(Event.PlaybackQueueEnded, async () => {
     if (currentMode === 'loop-once' && !loopOncePlayed) {
       loopOncePlayed = true;
@@ -81,7 +112,33 @@ export async function setupPlayer() {
     }
   });
 
+  // À chaque changement de piste, on rallonge la fenêtre si on approche du bord
+  // de ce qui est chargé. Petits ajouts (≤ WINDOW_BATCH), jamais de gros bloc.
+  TrackPlayer.addEventListener(Event.PlaybackActiveTrackChanged, () => {
+    void maybeExtendWindow();
+  });
+
   playerReady = true;
+}
+
+// Rallonge la file du player depuis sourceQueue quand il reste peu de pistes
+// devant la piste courante. Ne retire jamais l'arrière (précédent reste dispo).
+async function maybeExtendWindow() {
+  if (extending || windowLoaded >= sourceQueue.length) return;
+  const idx = (await TrackPlayer.getActiveTrackIndex()) ?? 0;
+  if (windowLoaded - idx > WINDOW_AHEAD) return; // assez d'avance chargée
+  extending = true;
+  try {
+    const next = sourceQueue.slice(windowLoaded, windowLoaded + WINDOW_BATCH);
+    if (next.length) {
+      await TrackPlayer.add(next.map(toPlayerTrack));
+      windowLoaded += next.length;
+    }
+  } catch {
+    // ignore : on réessaiera au prochain changement de piste
+  } finally {
+    extending = false;
+  }
 }
 
 // Mélange Fisher–Yates (copie, ne modifie pas l'original)
@@ -94,43 +151,13 @@ function shuffled<T>(arr: T[]): T[] {
   return a;
 }
 
-// Indices des morceaux à venir (après le morceau actif) dans la file du player
-async function upcomingIndices(): Promise<number[]> {
-  const len = (await TrackPlayer.getQueue()).length;
-  const idx = (await TrackPlayer.getActiveTrackIndex()) ?? 0;
-  const indices: number[] = [];
-  for (let i = idx + 1; i < len; i++) indices.push(i);
-  return indices;
-}
-
-// Mélange les morceaux à venir (garde le morceau courant en place).
-async function reshuffleUpcoming() {
-  const indices = await upcomingIndices();
-  if (indices.length < 2) return;
-  const queue = await TrackPlayer.getQueue();
-  const upcoming = indices.map(i => queue[i]);
-  await TrackPlayer.remove(indices);
-  await TrackPlayer.add(shuffled(upcoming)); // ré-ajouté après le morceau courant
-}
-
-// Restaure l'ordre canonique des morceaux à venir à partir du morceau courant.
-async function restoreOrder() {
-  if (!sourceQueue.length) return;
-  const active = await TrackPlayer.getActiveTrack();
-  const pos = sourceQueue.findIndex(t => t.id === active?.id);
-  if (pos < 0) return;
-  const indices = await upcomingIndices();
-  if (indices.length) await TrackPlayer.remove(indices);
-  await TrackPlayer.add(sourceQueue.slice(pos + 1).map(toPlayerTrack));
-}
-
-// Applique un mode : RepeatMode + réordonnancement éventuel de la file.
-async function applyMode(mode: PlayMode, prev: PlayMode) {
-  // On quitte shuffle pour un mode ordonné : on remet la file dans l'ordre.
-  if (prev === 'shuffle' && mode !== 'shuffle') await restoreOrder();
+// Applique un mode. Avec la file fenêtrée, on ne réordonne PAS la file déjà
+// chargée (ça impliquerait de gros remove/add bloquants) : on se contente du
+// RepeatMode. Le changement d'ordre (aléatoire ↔ ordonné) prend effet au
+// prochain morceau lancé, qui refige sourceQueue. [TODO: réordonner la fenêtre]
+async function applyMode(mode: PlayMode, _prev: PlayMode) {
   if (mode === 'loop-once') loopOncePlayed = false; // ré-arme la répétition unique
   await TrackPlayer.setRepeatMode(repeatModeFor(mode));
-  if (mode === 'shuffle') await reshuffleUpcoming();
 }
 
 // Convertit un Track de l'app en objet TrackPlayer.
@@ -145,7 +172,7 @@ export function toPlayerTrack(t: any) {
     title:    t.title,
     artist:   t.artist,
     album:    t.album,
-    artwork:  t.artUri ?? undefined,
+    artwork:  t.artUri || undefined, // "" (pas de pochette) → undefined
     duration: t.duration ? t.duration / 1000 : undefined, // ms → secondes
     genre:    t.genre,
   };
@@ -156,19 +183,25 @@ export function toPlayerTrack(t: any) {
 // progression/à l'état (donc sans re-render 2×/s). usePlayer() ne fait plus que
 // exposer l'état réactif nécessaire à l'affichage.
 
-// Joue un morceau (et charge sa file depuis la bibliothèque)
+// Joue un morceau. On fige l'ordre de lecture complet dans sourceQueue, mais on
+// ne charge dans le moteur audio qu'une FENÊTRE initiale (WINDOW_INITIAL pistes).
+// Le reste est ajouté au fil de l'eau par maybeExtendWindow() → démarrage
+// instantané même avec des milliers de titres (track-player tourne sur le thread
+// UI, donc un gros add bloquerait tout : voir maybeExtendWindow).
 export async function playTrack(track: any, queue: any[]) {
+  setOptimistic(null); // nouveau morceau : on repart sur l'état réel
   await TrackPlayer.reset();
   const clickedIdx = queue.findIndex(t => t.id === track.id);
   const ordered = clickedIdx >= 0
     ? [...queue.slice(clickedIdx), ...queue.slice(0, clickedIdx)]
     : [track, ...queue];
-  sourceQueue = ordered;
-  loopOncePlayed = false;
-  const toAdd = currentMode === 'shuffle'
+  // Ordre de lecture figé (mélangé d'emblée en mode aléatoire, sauf le 1er).
+  sourceQueue = currentMode === 'shuffle'
     ? [ordered[0], ...shuffled(ordered.slice(1))]
     : ordered;
-  await TrackPlayer.add(toAdd.map(toPlayerTrack));
+  loopOncePlayed = false;
+  windowLoaded = Math.min(WINDOW_INITIAL, sourceQueue.length);
+  await TrackPlayer.add(sourceQueue.slice(0, windowLoaded).map(toPlayerTrack));
   await TrackPlayer.setRepeatMode(repeatModeFor(currentMode));
   await TrackPlayer.play();
 }
@@ -177,23 +210,32 @@ export async function playTrack(track: any, queue: any[]) {
 export async function addNext(track: any) {
   const queue = await TrackPlayer.getQueue();
   if (queue.length === 0) {
+    sourceQueue = [track];
+    windowLoaded = 1;
     await TrackPlayer.add([toPlayerTrack(track)]);
     await TrackPlayer.play();
     return;
   }
+  // La fenêtre du player est contiguë depuis sourceQueue[0], donc l'index player
+  // == l'index sourceQueue. On insère au même endroit dans les deux, et la
+  // fenêtre chargée gagne une piste.
   const idx = (await TrackPlayer.getActiveTrackIndex()) ?? 0;
   await TrackPlayer.add([toPlayerTrack(track)], idx + 1);
   sourceQueue.splice(idx + 1, 0, track);
+  if (idx + 1 <= windowLoaded) windowLoaded += 1;
 }
 
 export async function togglePlay() {
-  const {state} = await TrackPlayer.getPlaybackState();
-  if (state === State.Playing) await TrackPlayer.pause();
-  else await TrackPlayer.play();
+  // Décision immédiate sur l'état mis en cache (pas d'aller-retour natif avant
+  // d'agir) ; on bascule aussi l'icône tout de suite (optimiste).
+  const willPlay = lastPlaybackState !== State.Playing;
+  setOptimistic(willPlay);
+  if (willPlay) await TrackPlayer.play();
+  else await TrackPlayer.pause();
 }
 
-export const skipNext = () => { TrackPlayer.skipToNext().catch(() => {}); };
-export const skipPrev = () => { TrackPlayer.skipToPrevious().catch(() => {}); };
+export const skipNext = () => { setOptimistic(null); TrackPlayer.skipToNext().catch(() => {}); };
+export const skipPrev = () => { setOptimistic(null); TrackPlayer.skipToPrevious().catch(() => {}); };
 export const seekTo   = (pos: number) => { TrackPlayer.seekTo(pos); };
 
 export async function cyclePlayMode() {
@@ -210,17 +252,32 @@ export function usePlayer() {
   const playbackState = usePlaybackState();
   const activeTrack   = useActiveTrack();
   const [playMode, setPlayMode] = useState<PlayMode>(currentMode);
+  const [, rerender] = useReducer((c: number) => c + 1, 0);
 
   useEffect(() => {
     const sub = (m: PlayMode) => setPlayMode(m);
     modeSubscribers.add(sub);
     setPlayMode(currentMode);
-    return () => { modeSubscribers.delete(sub); };
+    const optSub = () => rerender();
+    optimisticSubs.add(optSub);
+    return () => { modeSubscribers.delete(sub); optimisticSubs.delete(optSub); };
   }, []);
 
-  const isPlaying = playbackState.state === State.Playing;
-  const isLoading = playbackState.state === State.Loading ||
-                    playbackState.state === State.Buffering;
+  const realPlaying = playbackState.state === State.Playing;
+
+  // Dès que le natif rejoint l'état optimiste visé, on efface l'optimiste pour
+  // repasser sur l'état réel (gère aussi les changements via la notification).
+  useEffect(() => {
+    if (optimisticPlaying !== null && optimisticPlaying === realPlaying) {
+      setOptimistic(null);
+    }
+  }, [realPlaying]);
+
+  const isPlaying = optimisticPlaying ?? realPlaying;
+  // Pas de spinner tant qu'un état optimiste est affiché (on montre pause/play).
+  const isLoading = optimisticPlaying === null &&
+                    (playbackState.state === State.Loading ||
+                     playbackState.state === State.Buffering);
 
   return {
     isPlaying,
