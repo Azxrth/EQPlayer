@@ -1903,7 +1903,7 @@ export default function App() {
       setScanCount(result.length);
       setScanState('done');
       // Cache la bibliothèque pour un démarrage instantané au prochain lancement.
-      AsyncStorage.setItem('cache.tracks', JSON.stringify(result)).catch(() => {});
+      AsyncStorage.setItem('cache.tracks.v2', JSON.stringify(result)).catch(() => {});
     } catch (e) {
       console.warn('Scan error:', e);
       setScanState('done');
@@ -1916,7 +1916,7 @@ export default function App() {
   useEffect(() => {
     (async () => {
       try {
-        const cached = await AsyncStorage.getItem('cache.tracks');
+        const cached = await AsyncStorage.getItem('cache.tracks.v2');
         if (cached) {
           const list = JSON.parse(cached) as Track[];
           if (list.length) {
@@ -1979,7 +1979,7 @@ export default function App() {
           if (ok) {
             setTracks(prev => {
               const next = prev.filter(x => x.id !== t.id);
-              AsyncStorage.setItem('cache.tracks', JSON.stringify(next)).catch(() => {});
+              AsyncStorage.setItem('cache.tracks.v2', JSON.stringify(next)).catch(() => {});
               return next;
             });
           }
