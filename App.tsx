@@ -31,6 +31,7 @@ import {useFavorites, toggleFavorite} from './src/useFavorites';
 import {useTrackMenu, openTrackMenu, closeTrackMenu} from './src/useTrackMenu';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import {peqGetInfo, peqConfigure, peqSetGain, peqSetEnabled, presetGainsFor, hzLabel, type PeqBand} from './src/peq';
+import {reverbCheck, setSpeed, setReverb, SR_SPEED_MIN, SR_SPEED_MAX, REVERB_NAMES, SR_PRESETS} from './src/slowedReverb';
 
 // ─── Thème clair / sombre ───────────────────────────────────────────────────────
 // Tokens sémantiques : seul le « chrome » de l'app est thématisé.
@@ -475,6 +476,170 @@ const eqScrS = StyleSheet.create({
   hint:     {color:'#ffffff55', fontSize:11, textAlign:'center', marginTop:18, paddingHorizontal:24, lineHeight:16},
 });
 
+// ─── Slowed + Reverb ──────────────────────────────────────────────────────────
+
+// Slider horizontal réutilisable : revendique le geste (pas de conflit de scroll),
+// remonte la valeur en direct (onLive) puis au relâcher (onCommit). step borne
+// la granularité (continu = step fin ; presets = step 1).
+const HSlider = ({value, min, max, step, bright, onLive, onCommit}: {
+  value: number; min: number; max: number; step: number; bright: string;
+  onLive: (v: number) => void; onCommit: (v: number) => void;
+}) => {
+  const [w, setW] = useState(0);
+  const [v, setV] = useState(value);
+  const wRef = useRef(w); wRef.current = w;
+  // liveRef = dernière valeur posée, mise à jour SYNCHRONIQUEMENT (pas via le
+  // rendu). Indispensable : pour un tap/un drag rapide, onPanResponderRelease se
+  // déclenche AVANT que React n'ait re-rendu, donc un ref lié au rendu (vRef = v)
+  // serait encore sur l'ancienne valeur → le commit écraserait la nouvelle (le
+  // curseur « revenait au début »).
+  const liveRef = useRef(value);
+  useEffect(() => { setV(value); liveRef.current = value; }, [value]);
+
+  const cb = useRef({onLive, onCommit, min, max, step});
+  cb.current = {onLive, onCommit, min, max, step};
+  // Valeur depuis la position X (relative à la piste). On arrondit au step PUIS
+  // à 3 décimales pour éviter le bruit flottant (0.8500000001).
+  const valueAt = (x: number) => {
+    const {min: lo, max: hi, step: st} = cb.current;
+    const r = wRef.current > 0 ? Math.max(0, Math.min(1, x / wRef.current)) : 0;
+    return Math.round(Math.round((lo + r * (hi - lo)) / st) * st * 1000) / 1000;
+  };
+  const apply = (x: number) => {
+    const nv = valueAt(x);
+    if (nv !== liveRef.current) { liveRef.current = nv; setV(nv); cb.current.onLive(nv); }
+  };
+  const pan = useRef(
+    PanResponder.create({
+      onStartShouldSetPanResponder: () => true,
+      onStartShouldSetPanResponderCapture: () => true,
+      onMoveShouldSetPanResponder: () => true,
+      onMoveShouldSetPanResponderCapture: () => true,
+      onPanResponderTerminationRequest: () => false,
+      onShouldBlockNativeResponder: () => true,
+      onPanResponderGrant: e => apply(e.nativeEvent.locationX),
+      onPanResponderMove:  e => apply(e.nativeEvent.locationX),
+      onPanResponderRelease: () => cb.current.onCommit(liveRef.current),
+      onPanResponderTerminate: () => cb.current.onCommit(liveRef.current),
+    }),
+  ).current;
+
+  const ratio = Math.max(0, Math.min(1, (v - min) / ((max - min) || 1)));
+  return (
+    <View style={srS.sliderHit} {...pan.panHandlers} onLayout={e => setW(e.nativeEvent.layout.width)}>
+      {/* pointerEvents none : la piste/le bouton ne capturent jamais le toucher,
+          donc locationX reste relatif au conteneur (sinon il « revient au début »
+          quand le doigt passe sur le bouton). */}
+      <View style={srS.sliderTrack} pointerEvents="none">
+        <View style={[srS.sliderFill, {width: `${ratio * 100}%`, backgroundColor: bright}]}/>
+        <View style={[srS.sliderKnob, {left: `${ratio * 100}%`, backgroundColor: bright}]}/>
+      </View>
+    </View>
+  );
+};
+
+type SrApi = {
+  available: boolean;
+  speed: number;
+  reverb: number;
+  presetName: string;
+  onSpeedLive: (v: number) => void;     // audio seulement (pendant le glissement)
+  onSpeedCommit: (v: number) => void;   // état app + persistance (au relâcher)
+  onReverbLive: (level: number) => void;
+  onReverbCommit: (level: number) => void;
+  onPreset: (name: string) => void;
+  onReset: () => void;
+};
+
+// Page plein écran « Slowed + Reverb » : presets rapides + réglage fin de la
+// vitesse (qui abaisse aussi le pitch) et de la réverbération.
+const SlowedReverbScreen = ({visible, onClose, sr, bright}: {
+  visible: boolean; onClose: () => void; sr: SrApi; bright: string;
+}) => {
+  // Valeurs affichées en DIRECT, locales à cet écran. Pendant le glissement on
+  // ne touche PAS à l'état de l'app (sinon toute l'app se re-rend à chaque pixel
+  // → lag sur le JM21, comme l'avait la barre du son). On ne remonte l'état app
+  // qu'au relâcher (onCommit). Resynchronisé sur les valeurs de l'app à l'ouverture.
+  const [dispSpeed, setDispSpeed]   = useState(sr.speed);
+  const [dispReverb, setDispReverb] = useState(sr.reverb);
+  useEffect(() => { setDispSpeed(sr.speed); }, [sr.speed]);
+  useEffect(() => { setDispReverb(sr.reverb); }, [sr.reverb]);
+  if (!visible) return null;
+  return (
+    <View style={eqScrS.root}>
+      <StatusBar barStyle="light-content" backgroundColor="#0a0a0d"/>
+      <View style={eqScrS.header}>
+        <TouchableOpacity onPress={onClose} style={eqScrS.hBtn}>
+          <MaterialCommunityIcons name="chevron-down" size={28} color="#fff"/>
+        </TouchableOpacity>
+        <Text style={eqScrS.title}>Slowed + Reverb</Text>
+        <TouchableOpacity onPress={sr.onReset} style={eqScrS.resetBtn}>
+          <Text style={eqScrS.resetTxt}>Réinitialiser</Text>
+        </TouchableOpacity>
+      </View>
+
+      <View style={[eqScrS.body, {justifyContent:'flex-start', paddingTop:8}]}>
+        {/* Presets rapides */}
+        <View style={srS.presetRow}>
+          {SR_PRESETS.map(p => {
+            const active = p.name === sr.presetName;
+            return (
+              <TouchableOpacity
+                key={p.name}
+                style={[srS.presetChip, active && {backgroundColor: bright}]}
+                onPress={() => sr.onPreset(p.name)}>
+                <Text style={[srS.presetTxt, active && {color:'#111', fontWeight:'700'}]}>{p.name}</Text>
+              </TouchableOpacity>
+            );
+          })}
+        </View>
+
+        {/* Vitesse + pitch */}
+        <View style={srS.card}>
+          <View style={srS.cardHead}>
+            <Text style={srS.cardLabel}>Vitesse</Text>
+            <Text style={[srS.cardValue, {color: bright}]}>{dispSpeed.toFixed(2)}×</Text>
+          </View>
+          <HSlider
+            value={sr.speed} min={SR_SPEED_MIN} max={SR_SPEED_MAX} step={0.01} bright={bright}
+            onLive={v => { setDispSpeed(v); sr.onSpeedLive(v); }} onCommit={sr.onSpeedCommit}/>
+          <Text style={srS.cardHint}>Abaisse la vitesse et la tonalité ensemble — le vrai son « slowed ». Pas de perte de qualité.</Text>
+        </View>
+
+        {/* Réverbération */}
+        <View style={srS.card}>
+          <View style={srS.cardHead}>
+            <Text style={srS.cardLabel}>Réverbération</Text>
+            <Text style={[srS.cardValue, {color: bright}]}>{REVERB_NAMES[dispReverb]}</Text>
+          </View>
+          {sr.available ? (
+            <HSlider
+              value={sr.reverb} min={0} max={6} step={1} bright={bright}
+              onLive={v => { setDispReverb(v); sr.onReverbLive(v); }} onCommit={sr.onReverbCommit}/>
+          ) : (
+            <Text style={srS.cardHint}>Réverbération non disponible sur cet appareil.</Text>
+          )}
+        </View>
+      </View>
+    </View>
+  );
+};
+
+const srS = StyleSheet.create({
+  presetRow:   {flexDirection:'row', flexWrap:'wrap', gap:8, paddingHorizontal:8, marginBottom:18},
+  presetChip:  {paddingHorizontal:14, paddingVertical:9, borderRadius:20, backgroundColor:'#ffffff14'},
+  presetTxt:   {color:'#fff', fontSize:13, fontWeight:'600'},
+  card:        {backgroundColor:'#0c0c0fcc', borderRadius:14, padding:16, marginHorizontal:8, marginBottom:14},
+  cardHead:    {flexDirection:'row', alignItems:'center', justifyContent:'space-between', marginBottom:14},
+  cardLabel:   {color:'#fff', fontSize:15, fontWeight:'600'},
+  cardValue:   {fontSize:15, fontWeight:'700'},
+  cardHint:    {color:'#ffffff55', fontSize:11, marginTop:14, lineHeight:16},
+  sliderHit:   {height:36, justifyContent:'center'},
+  sliderTrack: {height:4, borderRadius:2, backgroundColor:'#ffffff1f', justifyContent:'center'},
+  sliderFill:  {position:'absolute', left:0, height:4, borderRadius:2},
+  sliderKnob:  {position:'absolute', width:18, height:18, borderRadius:9, marginLeft:-9, borderWidth:2, borderColor:'#000'},
+});
+
 // ─── Helpers temps ────────────────────────────────────────────────────────────
 function fmtTime(sec: number): string {
   if (!isFinite(sec) || sec < 0) return '0:00';
@@ -486,7 +651,9 @@ function fmtTime(sec: number): string {
 // Barre de progression isolée : SEUL ce composant s'abonne à la progression
 // (re-render 2×/s), donc le reste du lecteur ne se re-rend pas à chaque tick.
 const PlayerProgress = ({bright}: {bright: string}) => {
-  const progress = useProgress(500);
+  // 250 ms : la barre avance 2× plus finement (motion fluide). Ce composant est
+  // isolé, donc ce re-render plus fréquent ne touche QUE la barre, pas le lecteur.
+  const progress = useProgress(250);
   const [seekRatio, setSeekRatio] = useState<number | null>(null);
   // Position visée après un seek, gardée affichée jusqu'à ce que la position
   // réelle la rejoigne — sinon le curseur « revient » à l'ancien temps le temps
@@ -535,7 +702,10 @@ const PlayerProgress = ({bright}: {bright: string}) => {
   return (
     <View style={pS.progressWrap}>
       <View style={pS.progressHit} {...seekPan.panHandlers}>
-        <View style={pS.progressTrack}>
+        {/* pointerEvents none : le remplissage et la pastille ne captent jamais
+            le toucher, donc locationX reste relatif à la zone tactile (sinon le
+            curseur « revient au début » quand le doigt passe sur la pastille). */}
+        <View style={pS.progressTrack} pointerEvents="none">
           <View style={[pS.progressFill, {width: `${pct * 100}%`, backgroundColor: bright}]}/>
           <View style={[pS.progressThumb, {
             left: `${pct * 100}%`,
@@ -553,9 +723,9 @@ const PlayerProgress = ({bright}: {bright: string}) => {
 };
 
 // ─── Player ───────────────────────────────────────────────────────────────────
-const PlayerScreen = ({track, onClose, eq, onOpenEq}: {
+const PlayerScreen = ({track, onClose, eq, onOpenEq, onOpenSr, srActive}: {
   track: Track; onClose: () => void;
-  eq: EqApi; onOpenEq: () => void;
+  eq: EqApi; onOpenEq: () => void; onOpenSr: () => void; srActive: boolean;
 }) => {
   const [addOpen,   setAddOpen]   = useState(false);
   const favorites = useFavorites();
@@ -727,6 +897,17 @@ const PlayerScreen = ({track, onClose, eq, onOpenEq}: {
             <Text style={[pS.timeText, {paddingVertical:12}]}>Non disponible sur cet appareil.</Text>
           </View>
         )}
+
+        {/* Slowed + Reverb — ouvre la page dédiée */}
+        <TouchableOpacity style={pS.section} activeOpacity={0.8} onPress={onOpenSr}>
+          <View style={pS.sectionHeader}>
+            <MaterialCommunityIcons name="waveform" size={14} color="#ffffff66"/>
+            <Text style={pS.sectionTitle}>Slowed + Reverb</Text>
+            <View style={{flex:1}}/>
+            <Text style={pS.eqOpenHint}>{srActive ? 'Activé' : 'Régler'}</Text>
+            <MaterialCommunityIcons name="chevron-right" size={20} color="#ffffff88"/>
+          </View>
+        </TouchableOpacity>
 
         {/* File d'attente — morceaux à venir, cliquables */}
         <View style={pS.section}>
@@ -1803,6 +1984,7 @@ export default function App() {
   const [currentTrack, setCurrentTrack] = useState<Track|null>(null);
   const [playerOpen,   setPlayerOpen]   = useState(false);
   const [eqOpen,       setEqOpen]       = useState(false);
+  const [srOpen,       setSrOpen]       = useState(false);
   // Menu 3-points : modales et navigation
   const menuTrack = useTrackMenu();
   const favoritesIds = useFavorites();
@@ -1822,6 +2004,10 @@ export default function App() {
   // Égaliseur paramétrique (DynamicsProcessing) : fréquences + gains éditables
   const [peqRange, setPeqRange] = useState<{minDb: number; maxDb: number} | null>(null);
   const [eqBands,  setEqBands]  = useState<PeqBand[]>([]);
+  // Slowed + Reverb : vitesse (pilote aussi le pitch) + niveau de réverbération
+  const [srSpeed,     setSrSpeed]     = useState(1.0);
+  const [srReverb,    setSrReverb]    = useState(0);
+  const [srAvailable, setSrAvailable] = useState(false);
 
   // setter qui met à jour l'état ET enregistre sur disque
   const persist = useCallback(
@@ -1843,10 +2029,20 @@ export default function App() {
     (async () => {
       const stored = await AsyncStorage.getMany([
         'pref.theme', 'pref.eq', 'pref.quality', 'pref.peqBands',
+        'pref.srSpeed', 'pref.srReverb',
       ]);
       if (stored['pref.theme'])   setTheme(stored['pref.theme']!);
       if (stored['pref.eq'])      setEq(stored['pref.eq']!);
       if (stored['pref.quality']) setQuality(stored['pref.quality']!);
+
+      // Slowed + Reverb : restaure et applique vitesse/pitch + réverbération.
+      const savedSpeed = stored['pref.srSpeed'] ? parseFloat(stored['pref.srSpeed']!) : 1.0;
+      const savedReverb = stored['pref.srReverb'] ? parseInt(stored['pref.srReverb']!, 10) : 0;
+      if (savedSpeed && savedSpeed !== 1.0) { setSrSpeed(savedSpeed); setSpeed(savedSpeed); }
+      reverbCheck().then(ok => {
+        setSrAvailable(ok);
+        if (ok && savedReverb > 0) { setSrReverb(savedReverb); setReverb(savedReverb); }
+      });
 
       const info = await peqGetInfo();
       if (!info) return;             // EQ paramétrique indisponible
@@ -1957,6 +2153,41 @@ export default function App() {
     setEqPref('Personnalisé');
   }, [setEqPref]);
 
+  // ─── Slowed + Reverb ────────────────────────────────────────────────────────
+  // En DIRECT pendant le glissement : on ne fait QUE l'audio natif (pas de
+  // setState ici → pas de re-render de l'app à chaque pixel, donc fluide). L'écran
+  // gère l'affichage en local. L'état app + la persistance se font au relâcher.
+  const onSrSpeedLive = useCallback((v: number) => { setSpeed(v); }, []);
+  const onSrSpeedCommit = useCallback((v: number) => {
+    setSrSpeed(v); setSpeed(v);
+    AsyncStorage.setItem('pref.srSpeed', String(v)).catch(() => {});
+  }, []);
+  const onSrReverbLive = useCallback((level: number) => { setReverb(level); }, []);
+  const onSrReverbCommit = useCallback((level: number) => {
+    setSrReverb(level); setReverb(level);
+    AsyncStorage.setItem('pref.srReverb', String(level)).catch(() => {});
+  }, []);
+  // Préréglage combiné : applique vitesse + réverbération d'un coup
+  const onSrPreset = useCallback((name: string) => {
+    const p = SR_PRESETS.find(x => x.name === name);
+    if (!p) return;
+    setSrSpeed(p.speed); setSpeed(p.speed);
+    AsyncStorage.setItem('pref.srSpeed', String(p.speed)).catch(() => {});
+    setSrReverb(p.reverb); setReverb(p.reverb);
+    AsyncStorage.setItem('pref.srReverb', String(p.reverb)).catch(() => {});
+  }, []);
+  const onSrReset = useCallback(() => {
+    setSrSpeed(1.0); setSpeed(1.0);
+    setSrReverb(0); setReverb(0);
+    AsyncStorage.removeMany(['pref.srSpeed', 'pref.srReverb']).catch(() => {});
+  }, []);
+  // Nom du préréglage actif (sinon « Personnalisé »), pour surligner la puce.
+  const srPresetName = useMemo(() => {
+    const m = SR_PRESETS.find(p => p.speed === srSpeed && p.reverb === srReverb);
+    return m ? m.name : 'Personnalisé';
+  }, [srSpeed, srReverb]);
+  const srActive = srSpeed !== 1.0 || srReverb > 0;
+
   const scan = useCallback(async () => {
     setScanState('scanning');
     const granted = await requestMusicPermission();
@@ -2029,6 +2260,7 @@ export default function App() {
   const navToCategory = useCallback((type: 'album' | 'artist', value: string) => {
     setPlayerOpen(false);
     setEqOpen(false);
+    setSrOpen(false);
     setPage(0);
     setLibNav({type, value});
   }, []);
@@ -2118,12 +2350,25 @@ export default function App() {
           onClose={() => setPlayerOpen(false)}
           eq={{range: peqRange, bands: eqBands, onGainLive, onGainCommit, onSetFreq, onAddBand, onRemoveBand, onReset: onResetBands}}
           onOpenEq={() => setEqOpen(true)}
+          onOpenSr={() => setSrOpen(true)}
+          srActive={srActive}
         />
       )}
       <EqualizerScreen
         visible={eqOpen}
         onClose={() => setEqOpen(false)}
         eq={{range: peqRange, bands: eqBands, onGainLive, onGainCommit, onSetFreq, onAddBand, onRemoveBand, onReset: onResetBands}}
+        bright={getPalette(currentTrack?.genre).bright}
+      />
+      <SlowedReverbScreen
+        visible={srOpen}
+        onClose={() => setSrOpen(false)}
+        sr={{
+          available: srAvailable, speed: srSpeed, reverb: srReverb, presetName: srPresetName,
+          onSpeedLive: onSrSpeedLive, onSpeedCommit: onSrSpeedCommit,
+          onReverbLive: onSrReverbLive, onReverbCommit: onSrReverbCommit,
+          onPreset: onSrPreset, onReset: onSrReset,
+        }}
         bright={getPalette(currentTrack?.genre).bright}
       />
 

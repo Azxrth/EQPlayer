@@ -6,6 +6,7 @@ import TrackPlayer, {
   Event,
   RepeatMode,
 } from 'react-native-track-player';
+import {reapplySpeed} from './slowedReverb';
 // Hooks re-exportés via require pour contourner le bug exports:[] dans package.json
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const RNTP = require('react-native-track-player');
@@ -237,6 +238,8 @@ export async function playTrack(track: any, queue: any[]) {
   await TrackPlayer.add(sourceQueue.slice(0, windowLoaded).map(toPlayerTrack));
   await TrackPlayer.setRepeatMode(repeatModeFor(currentMode));
   await TrackPlayer.play();
+  // reset() a pu remettre l'ExoPlayer à la vitesse normale → on réapplique.
+  reapplySpeed();
 }
 
 // Insère un morceau juste après le morceau courant (« Lire ensuite »).
