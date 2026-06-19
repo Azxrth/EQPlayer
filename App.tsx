@@ -10,6 +10,7 @@ import {
   StatusBar,
   Dimensions,
   PanResponder,
+  Animated,
   Image,
   Modal,
   Alert,
@@ -559,6 +560,37 @@ const PlayerScreen = ({track, onClose, eq, onOpenEq}: {
   const [addOpen,   setAddOpen]   = useState(false);
   const favorites = useFavorites();
 
+  // Geste « glisser vers le bas pour fermer » : tout le lecteur suit le doigt,
+  // se ferme au-delà d'un seuil (ou d'un flick rapide), sinon revient en place.
+  // Le geste vit sur un CALQUE transparent posé SUR la cover (frère de la
+  // ScrollView, donc au-dessus) : la ScrollView native ne peut pas avaler le
+  // drag. Le calque n'est actif que quand la liste est tout en haut (atTop).
+  const dragY = useRef(new Animated.Value(0)).current;
+  const [atTop, setAtTop] = useState(true);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+  const dismissPan = useRef(
+    PanResponder.create({
+      // Pas de onStartShouldSet… : sinon le calque avalerait aussi le scroll
+      // vers le haut commencé sur la cover. On ne réclame QUE les drags vers
+      // le bas (dismiss) ; les autres passent à la ScrollView en dessous.
+      onMoveShouldSetPanResponder: (_, g) => g.dy > 6 && g.dy > Math.abs(g.dx),
+      onPanResponderMove: (_, g) => { if (g.dy > 0) dragY.setValue(g.dy); },
+      onPanResponderRelease: (_, g) => {
+        if (g.dy > 120 || g.vy > 1.2) {
+          Animated.timing(dragY, {
+            toValue: Dimensions.get('window').height,
+            duration: 200, useNativeDriver: true,
+          }).start(() => onCloseRef.current());
+        } else {
+          Animated.spring(dragY, {toValue: 0, useNativeDriver: true, bounciness: 4}).start();
+        }
+      },
+      onPanResponderTerminate: () =>
+        Animated.spring(dragY, {toValue: 0, useNativeDriver: true, bounciness: 4}).start(),
+    }),
+  ).current;
+
   // Contrôles + état d'affichage (la progression est gérée par <PlayerProgress>)
   const {isPlaying, isLoading, activeTrack, playMode, togglePlay, skipNext, skipPrev, cyclePlayMode} = usePlayer();
 
@@ -602,7 +634,8 @@ const PlayerScreen = ({track, onClose, eq, onOpenEq}: {
   }[playMode] ?? 'repeat');
 
   return (
-    <View style={[pS.root, {backgroundColor:palette.dark}]}>
+    <Animated.View
+      style={[pS.root, {backgroundColor:palette.dark, transform:[{translateY: dragY}]}]}>
       <View style={[pS.blob1, {backgroundColor:palette.mid+'99'}]}/>
       <View style={[pS.blob2, {backgroundColor:palette.bright+'22'}]}/>
       <StatusBar barStyle="light-content" backgroundColor="transparent" translucent/>
@@ -618,7 +651,9 @@ const PlayerScreen = ({track, onClose, eq, onOpenEq}: {
         </TouchableOpacity>
       </View>
 
-      <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={pS.scroll}>
+      <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={pS.scroll}
+        scrollEventThrottle={16}
+        onScroll={e => { const top = e.nativeEvent.contentOffset.y <= 0; setAtTop(prev => prev === top ? prev : top); }}>
         {/* Cover */}
         <View style={pS.coverWrap}>
           {coverUri ? (
@@ -719,11 +754,19 @@ const PlayerScreen = ({track, onClose, eq, onOpenEq}: {
         </View>
       </ScrollView>
 
+      {/* Calque transparent de fermeture par glissement, posé SUR la cover et
+          au-dessus de la ScrollView (la ScrollView native ne peut donc pas
+          intercepter le drag). Inactif dès qu'on a fait défiler (atTop=false). */}
+      <View
+        pointerEvents={atTop ? 'auto' : 'none'}
+        style={{position:'absolute', top:88, left:0, right:0, height:width*0.72+40}}
+        {...dismissPan.panHandlers}/>
+
       <AddToPlaylistSheet
         trackId={(displayTrack as any)?.id ?? null}
         visible={addOpen}
         onClose={() => setAddOpen(false)}/>
-    </View>
+    </Animated.View>
   );
 };
 
