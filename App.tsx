@@ -487,6 +487,10 @@ function fmtTime(sec: number): string {
 const PlayerProgress = ({bright}: {bright: string}) => {
   const progress = useProgress(500);
   const [seekRatio, setSeekRatio] = useState<number | null>(null);
+  // Position visée après un seek, gardée affichée jusqu'à ce que la position
+  // réelle la rejoigne — sinon le curseur « revient » à l'ancien temps le temps
+  // que le seek natif aboutisse (sondé seulement toutes les 500 ms).
+  const [pendingSeek, setPendingSeek] = useState<number | null>(null);
   const TRACK_W = width - 48;
   const durationRef = useRef(0);
   durationRef.current = progress.duration;
@@ -499,15 +503,34 @@ const PlayerProgress = ({bright}: {bright: string}) => {
       onPanResponderMove:  e => setSeekRatio(ratioFromX(e.nativeEvent.locationX)),
       onPanResponderRelease: e => {
         const r = ratioFromX(e.nativeEvent.locationX);
-        seekTo(r * (durationRef.current || 0));
+        const target = r * (durationRef.current || 0);
+        seekTo(target);
+        setPendingSeek(target); // on garde la cible affichée…
         setSeekRatio(null);
       },
       onPanResponderTerminate: () => setSeekRatio(null),
     }),
   ).current;
-  const livePct  = progress.duration > 0 ? progress.position / progress.duration : 0;
-  const pct      = seekRatio !== null ? seekRatio : livePct;
-  const shownPos = seekRatio !== null ? seekRatio * progress.duration : progress.position;
+
+  // …jusqu'à ce que la position réelle rejoigne la cible (à ~1,2 s près).
+  useEffect(() => {
+    if (pendingSeek !== null && Math.abs(progress.position - pendingSeek) < 1.2) {
+      setPendingSeek(null);
+    }
+  }, [progress.position, pendingSeek]);
+  // Sécurité : si la position ne converge pas (fin de piste, changement de
+  // morceau…), on lâche la cible après un court délai.
+  useEffect(() => {
+    if (pendingSeek === null) return;
+    const id = setTimeout(() => setPendingSeek(null), 1500);
+    return () => clearTimeout(id);
+  }, [pendingSeek]);
+
+  const effectivePos = seekRatio !== null ? seekRatio * progress.duration
+                     : pendingSeek  !== null ? pendingSeek
+                     : progress.position;
+  const pct      = progress.duration > 0 ? effectivePos / progress.duration : 0;
+  const shownPos = effectivePos;
   return (
     <View style={pS.progressWrap}>
       <View style={pS.progressHit} {...seekPan.panHandlers}>
