@@ -24,7 +24,7 @@ import MaterialCommunityIcons from 'react-native-vector-icons/MaterialCommunityI
 import TrackPlayer from 'react-native-track-player';
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const {useActiveTrack} = require('react-native-track-player') as {useActiveTrack: () => import('react-native-track-player').Track | undefined};
-import {setupPlayer, usePlayer, useProgress, playTrack, addNext, seekTo} from './src/usePlayer';
+import {setupPlayer, usePlayer, useProgress, playTrack, addNext, seekTo, getUpNext, jumpToIndex, removeFromQueue} from './src/usePlayer';
 import {usePlaylists, createPlaylist, renamePlaylist, deletePlaylist, toggleTrack, removeTrack, type Playlist} from './src/usePlaylists';
 import {useFavorites, toggleFavorite} from './src/useFavorites';
 import {useTrackMenu, openTrackMenu, closeTrackMenu} from './src/useTrackMenu';
@@ -543,9 +543,8 @@ const PlayerScreen = ({track, onClose, eq, onOpenEq}: {
   const [upNext, setUpNext] = useState<any[]>([]);
   const refreshQueue = useCallback(async () => {
     try {
-      const q = await TrackPlayer.getQueue();
-      const idx = (await TrackPlayer.getActiveTrackIndex()) ?? 0;
-      setUpNext(q.slice(idx + 1).map((t: any, i: number) => ({...t, _qIndex: idx + 1 + i})));
+      // Toute la file à venir (sourceQueue), pas seulement la fenêtre chargée.
+      setUpNext(await getUpNext());
     } catch { /* lecteur pas prêt */ }
   }, []);
   useEffect(() => {
@@ -555,11 +554,10 @@ const PlayerScreen = ({track, onClose, eq, onOpenEq}: {
   }, [activeTrack, isPlaying, refreshQueue]);
 
   const jumpTo = useCallback(async (index: number) => {
-    await TrackPlayer.skip(index).catch(() => {});
-    await TrackPlayer.play();
+    await jumpToIndex(index);
   }, []);
   const removeAt = useCallback(async (index: number) => {
-    await TrackPlayer.remove([index]).catch(() => {});
+    await removeFromQueue(index);
     refreshQueue();
   }, [refreshQueue]);
 
@@ -678,9 +676,9 @@ const PlayerScreen = ({track, onClose, eq, onOpenEq}: {
           {upNext.length === 0 ? (
             <Text style={[pS.timeText, {paddingVertical:12}]}>Aucun morceau à suivre.</Text>
           ) : upNext.map(t => (
-            <TouchableOpacity key={t._qIndex} style={pS.queueRow} activeOpacity={0.7} onPress={() => jumpTo(t._qIndex)}>
-              {t.artwork ? (
-                <Image source={{uri: t.artwork}} style={pS.queueCover} resizeMode="cover"/>
+            <TouchableOpacity key={t._sIndex} style={pS.queueRow} activeOpacity={0.7} onPress={() => jumpTo(t._sIndex)}>
+              {(t.artwork ?? t.artUri) ? (
+                <Image source={{uri: t.artwork ?? t.artUri}} style={pS.queueCover} resizeMode="cover"/>
               ) : (
                 <View style={[pS.queueCover, {backgroundColor:coverBg(t.genre)}]}>
                   <MaterialCommunityIcons name="music" size={14} color="#ffffff44"/>
@@ -690,7 +688,7 @@ const PlayerScreen = ({track, onClose, eq, onOpenEq}: {
                 <Text style={pS.queueTitle} numberOfLines={1}>{t.title}</Text>
                 <Text style={pS.queueArtist} numberOfLines={1}>{t.artist}</Text>
               </View>
-              <TouchableOpacity onPress={() => removeAt(t._qIndex)} style={pS.queueRemove}>
+              <TouchableOpacity onPress={() => removeAt(t._sIndex)} style={pS.queueRemove}>
                 <MaterialCommunityIcons name="close" size={16} color="#555"/>
               </TouchableOpacity>
             </TouchableOpacity>

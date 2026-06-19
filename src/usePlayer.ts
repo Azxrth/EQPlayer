@@ -34,6 +34,7 @@ let currentMode: PlayMode = 'loop-once';
 // lecture. Ainsi l'ajout au player reste minuscule quelle que soit la taille de
 // la biblio (1867 titres) → démarrage et pause/play instantanés sur le JM21.
 let sourceQueue: any[] = [];
+let canonicalQueue: any[] = [];     // même contenu, ordre NON mélangé (pour restaurer)
 let windowLoaded = 0;               // nb de pistes de sourceQueue déjà dans le player
 let extending = false;              // anti-réentrance de l'extension de fenêtre
 const WINDOW_INITIAL = 50;          // pistes chargées d'avance au lancement
@@ -151,13 +152,44 @@ function shuffled<T>(arr: T[]): T[] {
   return a;
 }
 
-// Applique un mode. Avec la file fenêtrée, on ne réordonne PAS la file déjà
-// chargée (ça impliquerait de gros remove/add bloquants) : on se contente du
-// RepeatMode. Le changement d'ordre (aléatoire ↔ ordonné) prend effet au
-// prochain morceau lancé, qui refige sourceQueue. [TODO: réordonner la fenêtre]
-async function applyMode(mode: PlayMode, _prev: PlayMode) {
+// Réordonne les pistes À VENIR de sourceQueue (après l'index courant) selon le
+// mode : aléatoire = mélange la suite ; ordonné = restaure l'ordre canonique
+// (canonicalQueue) en retirant les pistes déjà passées.
+function reorderUpcomingSource(idx: number, mode: PlayMode) {
+  const head = sourceQueue.slice(0, idx + 1);
+  if (mode === 'shuffle') {
+    sourceQueue = [...head, ...shuffled(sourceQueue.slice(idx + 1))];
+  } else {
+    const passed = new Set(head.map(t => t.id));
+    const tail = canonicalQueue.filter(t => !passed.has(t.id));
+    sourceQueue = [...head, ...tail];
+  }
+}
+
+// Recharge la portion « à venir » de la fenêtre du player pour coller à
+// sourceQueue (après un réordonnancement). Borné à WINDOW_INITIAL → jamais de
+// gros bloc bloquant. Le reste sera rallongé par maybeExtendWindow.
+async function rebuildUpcoming() {
+  const idx = (await TrackPlayer.getActiveTrackIndex()) ?? 0;
+  const len = (await TrackPlayer.getQueue()).length;
+  const toRemove: number[] = [];
+  for (let i = idx + 1; i < len; i++) toRemove.push(i);
+  if (toRemove.length) await TrackPlayer.remove(toRemove);
+  const next = sourceQueue.slice(idx + 1, idx + 1 + WINDOW_INITIAL);
+  if (next.length) await TrackPlayer.add(next.map(toPlayerTrack));
+  windowLoaded = idx + 1 + next.length;
+}
+
+// Applique un mode : RepeatMode + réordonnancement de la file (fenêtré).
+async function applyMode(mode: PlayMode, prev: PlayMode) {
   if (mode === 'loop-once') loopOncePlayed = false; // ré-arme la répétition unique
   await TrackPlayer.setRepeatMode(repeatModeFor(mode));
+  // Entrée/sortie du mode aléatoire → on réordonne les pistes à venir.
+  if ((mode === 'shuffle') !== (prev === 'shuffle') && sourceQueue.length) {
+    const idx = (await TrackPlayer.getActiveTrackIndex()) ?? 0;
+    reorderUpcomingSource(idx, mode);
+    await rebuildUpcoming();
+  }
 }
 
 // Convertit un Track de l'app en objet TrackPlayer.
@@ -195,6 +227,7 @@ export async function playTrack(track: any, queue: any[]) {
   const ordered = clickedIdx >= 0
     ? [...queue.slice(clickedIdx), ...queue.slice(0, clickedIdx)]
     : [track, ...queue];
+  canonicalQueue = ordered; // ordre de référence (non mélangé) pour restaurer
   // Ordre de lecture figé (mélangé d'emblée en mode aléatoire, sauf le 1er).
   sourceQueue = currentMode === 'shuffle'
     ? [ordered[0], ...shuffled(ordered.slice(1))]
@@ -223,6 +256,10 @@ export async function addNext(track: any) {
   await TrackPlayer.add([toPlayerTrack(track)], idx + 1);
   sourceQueue.splice(idx + 1, 0, track);
   if (idx + 1 <= windowLoaded) windowLoaded += 1;
+  // garde la file canonique cohérente (sinon perdue à une restauration d'ordre)
+  const cpos = canonicalQueue.findIndex(t => t.id === sourceQueue[idx]?.id);
+  if (cpos >= 0) canonicalQueue.splice(cpos + 1, 0, track);
+  else canonicalQueue.push(track);
 }
 
 export async function togglePlay() {
@@ -237,6 +274,44 @@ export async function togglePlay() {
 export const skipNext = () => { setOptimistic(null); TrackPlayer.skipToNext().catch(() => {}); };
 export const skipPrev = () => { setOptimistic(null); TrackPlayer.skipToPrevious().catch(() => {}); };
 export const seekTo   = (pos: number) => { TrackPlayer.seekTo(pos); };
+
+// ─── File « à suivre » (sur sourceQueue, donc TOUTE la file, pas la fenêtre) ──
+
+// Morceaux à venir : on lit sourceQueue après l'index courant (index player ==
+// index sourceQueue car la fenêtre est contiguë depuis 0). Chaque item porte
+// son index sourceQueue (_sIndex) pour le saut/suppression.
+// limit borne l'affichage : la liste « à suivre » est rendue dans une ScrollView
+// NON virtualisée (.map), donc rendre 1800+ lignes saccaderait. 100 suffit en
+// pratique ; afficher toute la file demanderait de passer le lecteur en FlatList.
+export async function getUpNext(limit = 100): Promise<any[]> {
+  if (!sourceQueue.length) return [];
+  const idx = (await TrackPlayer.getActiveTrackIndex()) ?? 0;
+  return sourceQueue.slice(idx + 1, idx + 1 + limit).map((t, i) => ({...t, _sIndex: idx + 1 + i}));
+}
+
+// Saute à une piste de la file (index sourceQueue). Si elle n'est pas encore
+// dans la fenêtre chargée, on étend jusqu'à elle puis on skip.
+export async function jumpToIndex(sourceIndex: number) {
+  setOptimistic(null);
+  while (windowLoaded <= sourceIndex && windowLoaded < sourceQueue.length) {
+    const next = sourceQueue.slice(windowLoaded, windowLoaded + WINDOW_BATCH);
+    if (!next.length) break;
+    await TrackPlayer.add(next.map(toPlayerTrack));
+    windowLoaded += next.length;
+  }
+  await TrackPlayer.skip(sourceIndex).catch(() => {});
+  await TrackPlayer.play();
+}
+
+// Retire une piste à venir (index sourceQueue) de la file.
+export async function removeFromQueue(sourceIndex: number) {
+  if (sourceIndex < 0 || sourceIndex >= sourceQueue.length) return;
+  if (sourceIndex < windowLoaded) {
+    await TrackPlayer.remove([sourceIndex]).catch(() => {});
+    windowLoaded -= 1;
+  }
+  sourceQueue.splice(sourceIndex, 1);
+}
 
 export async function cyclePlayMode() {
   const prev = currentMode;
