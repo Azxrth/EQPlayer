@@ -32,6 +32,7 @@ import {useTrackMenu, openTrackMenu, closeTrackMenu} from './src/useTrackMenu';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import {peqGetInfo, peqConfigure, peqSetGain, peqSetEnabled, presetGainsFor, hzLabel, type PeqBand} from './src/peq';
 import {reverbCheck, setSpeed, setReverb, SR_SPEED_MIN, SR_SPEED_MAX, REVERB_NAMES, SR_PRESETS} from './src/slowedReverb';
+import {useEqTags, loadEqTags, setBaseBands, setEqEditing, createTag, renameTag, updateTagBands, deleteTag, setTrackTag, getTrackTagId, tracksUsingTag, type EqTag} from './src/eqTags';
 
 // ─── Thème clair / sombre ───────────────────────────────────────────────────────
 // Tokens sémantiques : seul le « chrome » de l'app est thématisé.
@@ -222,6 +223,26 @@ function eqInterp(pts: {hz: number; db: number}[], hz: number): number {
 }
 
 const EQ_MAX_BANDS = 15;
+
+// Ajoute une bande (gain 0) au plus grand écart en log-fréquence. Renvoie la
+// nouvelle liste triée (ou l'originale si on est déjà au maximum). Partagé par
+// l'EQ de base et l'éditeur de courbe d'un tag.
+function insertBand(bands: PeqBand[]): PeqBand[] {
+  if (bands.length >= EQ_MAX_BANDS) return bands;
+  const sorted = [...bands].sort((a, b) => a.freq - b.freq);
+  let freq = 1000;
+  if (sorted.length >= 2) {
+    let bestGap = 0;
+    for (let k = 0; k < sorted.length - 1; k++) {
+      const gap = Math.log(sorted[k + 1].freq) - Math.log(sorted[k].freq);
+      if (gap > bestGap) {
+        bestGap = gap;
+        freq = Math.round(Math.exp((Math.log(sorted[k].freq) + Math.log(sorted[k + 1].freq)) / 2));
+      }
+    }
+  }
+  return [...sorted, {freq, gain: 0}].sort((a, b) => a.freq - b.freq);
+}
 
 // Courbe de réponse : aire remplie approximée par des barres fines (sans SVG).
 const EqCurve = ({bands, minDb, maxDb, bright}: {bands: PeqBand[]; minDb: number; maxDb: number; bright: string}) => {
@@ -427,8 +448,8 @@ type EqApi = {
 
 // Page égaliseur plein écran : aucune ScrollView parente → les sliders ne
 // rentrent jamais en conflit avec le défilement de la page.
-const EqualizerScreen = ({visible, onClose, eq, bright}: {
-  visible: boolean; onClose: () => void; eq: EqApi; bright: string;
+const EqualizerScreen = ({visible, onClose, eq, bright, title}: {
+  visible: boolean; onClose: () => void; eq: EqApi; bright: string; title?: string;
 }) => {
   if (!visible || !eq.range) return null;
   return (
@@ -438,7 +459,7 @@ const EqualizerScreen = ({visible, onClose, eq, bright}: {
         <TouchableOpacity onPress={onClose} style={eqScrS.hBtn}>
           <MaterialCommunityIcons name="chevron-down" size={28} color="#fff"/>
         </TouchableOpacity>
-        <Text style={eqScrS.title}>Égaliseur</Text>
+        <Text style={eqScrS.title} numberOfLines={1}>{title ?? 'Égaliseur'}</Text>
         <TouchableOpacity onPress={eq.onReset} style={eqScrS.resetBtn}>
           <Text style={eqScrS.resetTxt}>Réinitialiser</Text>
         </TouchableOpacity>
@@ -475,6 +496,111 @@ const eqScrS = StyleSheet.create({
   body:     {flex:1, justifyContent:'center', paddingHorizontal:8, paddingBottom:40},
   hint:     {color:'#ffffff55', fontSize:11, textAlign:'center', marginTop:18, paddingHorizontal:24, lineHeight:16},
 });
+
+// ─── Égaliseurs par tag ───────────────────────────────────────────────────────
+
+// Gestionnaire de tags (CRUD) : créer, renommer, supprimer, éditer la courbe.
+// Plein écran (comme l'EQ) → aucun conflit de scroll avec les sliders de la
+// courbe (qui s'ouvre par-dessus).
+const EqTagsScreen = ({visible, onClose, tags, trackTags, onCreate, onEditEq, onRename, onDelete, bright}: {
+  visible: boolean; onClose: () => void;
+  tags: EqTag[]; trackTags: Record<string, string>;
+  onCreate: () => void; onEditEq: (id: string) => void;
+  onRename: (id: string) => void; onDelete: (id: string) => void;
+  bright: string;
+}) => {
+  if (!visible) return null;
+  return (
+    <View style={eqScrS.root}>
+      <StatusBar barStyle="light-content" backgroundColor="#0a0a0d"/>
+      <View style={eqScrS.header}>
+        <TouchableOpacity onPress={onClose} style={eqScrS.hBtn}>
+          <MaterialCommunityIcons name="chevron-down" size={28} color="#fff"/>
+        </TouchableOpacity>
+        <Text style={eqScrS.title} numberOfLines={1}>Égaliseurs par tag</Text>
+        <TouchableOpacity onPress={onCreate} style={eqScrS.hBtn}>
+          <MaterialCommunityIcons name="plus-circle-outline" size={24} color={bright}/>
+        </TouchableOpacity>
+      </View>
+      {tags.length === 0 ? (
+        <View style={tagS.empty}>
+          <MaterialCommunityIcons name="tag-multiple-outline" size={48} color="#ffffff22"/>
+          <Text style={tagS.emptyTxt}>Aucun tag. Crée un tag (ex. « breakcore », « rap »),
+            règle sa courbe, puis attribue-le à tes morceaux depuis leur menu ⋮.
+            Un morceau sans tag garde l'EQ de base.</Text>
+        </View>
+      ) : (
+        <ScrollView contentContainerStyle={{paddingBottom:40, paddingHorizontal:12}}>
+          {tags.map(t => {
+            const n = Object.values(trackTags).filter(id => id === t.id).length;
+            return (
+              <View key={t.id} style={tagS.row}>
+                <TouchableOpacity style={tagS.rowMain} activeOpacity={0.7} onPress={() => onEditEq(t.id)}>
+                  <MaterialCommunityIcons name="tune-vertical" size={20} color={bright}/>
+                  <View style={tagS.rowMeta}>
+                    <Text style={tagS.rowName} numberOfLines={1}>{t.name}</Text>
+                    <Text style={tagS.rowSub}>{n} morceau{n > 1 ? 'x' : ''} · {t.bands.length} bandes · toucher pour régler</Text>
+                  </View>
+                </TouchableOpacity>
+                <TouchableOpacity style={tagS.rowBtn} onPress={() => onRename(t.id)}>
+                  <MaterialCommunityIcons name="pencil-outline" size={20} color="#ffffff99"/>
+                </TouchableOpacity>
+                <TouchableOpacity style={tagS.rowBtn} onPress={() => onDelete(t.id)}>
+                  <MaterialCommunityIcons name="trash-can-outline" size={20} color="#ff4d6d"/>
+                </TouchableOpacity>
+              </View>
+            );
+          })}
+        </ScrollView>
+      )}
+    </View>
+  );
+};
+
+const tagS = StyleSheet.create({
+  empty:    {flex:1, alignItems:'center', justifyContent:'center', paddingHorizontal:36, gap:14},
+  emptyTxt: {color:'#ffffff66', fontSize:13, textAlign:'center', lineHeight:20},
+  row:      {flexDirection:'row', alignItems:'center', backgroundColor:'#0c0c0fcc', borderRadius:12, marginTop:10, paddingRight:6},
+  rowMain:  {flex:1, flexDirection:'row', alignItems:'center', gap:12, padding:14},
+  rowMeta:  {flex:1},
+  rowName:  {color:'#fff', fontSize:15, fontWeight:'600'},
+  rowSub:   {color:'#ffffff55', fontSize:11, marginTop:3},
+  rowBtn:   {padding:10},
+});
+
+// Feuille de sélection du tag d'un morceau (depuis le menu ⋮).
+const TagPickerSheet = ({visible, tags, currentTagId, onSelect, onManage, onClose}: {
+  visible: boolean; tags: EqTag[]; currentTagId: string | null;
+  onSelect: (tagId: string | null) => void; onManage: () => void; onClose: () => void;
+}) => {
+  const {setS} = useStyles();
+  const c = useColors();
+  return (
+    <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
+      <TouchableOpacity style={setS.backdrop} activeOpacity={1} onPress={onClose}>
+        <TouchableOpacity style={setS.sheet} activeOpacity={1}>
+          <Text style={setS.sheetTitle}>Égaliseur (tag)</Text>
+          <ScrollView style={setS.sheetList}>
+            <TouchableOpacity style={setS.option} onPress={() => { onSelect(null); onClose(); }}>
+              <Text style={[setS.optionText, !currentTagId && setS.optionTextActive]}>Aucun (EQ de base)</Text>
+              {!currentTagId && <MaterialCommunityIcons name="check" size={18} color={c.accent}/>}
+            </TouchableOpacity>
+            {tags.map(t => (
+              <TouchableOpacity key={t.id} style={setS.option} onPress={() => { onSelect(t.id); onClose(); }}>
+                <Text style={[setS.optionText, currentTagId === t.id && setS.optionTextActive]}>{t.name}</Text>
+                {currentTagId === t.id && <MaterialCommunityIcons name="check" size={18} color={c.accent}/>}
+              </TouchableOpacity>
+            ))}
+          </ScrollView>
+          <TouchableOpacity style={setS.newRow} onPress={() => { onClose(); onManage(); }}>
+            <MaterialCommunityIcons name="cog-outline" size={20} color={c.accent}/>
+            <Text style={setS.newText}>Gérer les tags…</Text>
+          </TouchableOpacity>
+        </TouchableOpacity>
+      </TouchableOpacity>
+    </Modal>
+  );
+};
 
 // ─── Slowed + Reverb ──────────────────────────────────────────────────────────
 
@@ -1690,11 +1816,12 @@ type SettingsProps = {
   eq: string;           setEq: (v: string) => void;
   quality: string;      setQuality: (v: string) => void;
   onScan: () => void;   scanState: 'idle'|'scanning'|'done'|'denied';
+  onOpenTags: () => void;
 };
 
 type PickerState = {title: string; options: string[]; current: string; onSelect: (v: string) => void} | null;
 
-const SettingsPage = ({theme, setTheme, eq, setEq, quality, setQuality, onScan, scanState}: SettingsProps) => {
+const SettingsPage = ({theme, setTheme, eq, setEq, quality, setQuality, onScan, scanState, onOpenTags}: SettingsProps) => {
   const [picker, setPicker] = useState<PickerState>(null);
   const {S, setS} = useStyles();
   const c = useColors();
@@ -1705,6 +1832,7 @@ const SettingsPage = ({theme, setTheme, eq, setEq, quality, setQuality, onScan, 
   const rows: {label: string; value: string; onPress: () => void}[] = [
     {label:'Thème',                  value: theme,   onPress: () => open('Thème', THEME_OPTS, theme, setTheme)},
     {label:'Égaliseur par défaut',   value: eq,      onPress: () => open('Égaliseur par défaut', EQ_OPTS, eq, setEq)},
+    {label:'Égaliseurs par tag',     value:'›',      onPress: onOpenTags},
     {label:'Qualité audio',          value: quality, onPress: () => open('Qualité audio', QUALITY_OPTS, quality, setQuality)},
     {label:'Scanner la bibliothèque', value: scanState === 'scanning' ? '…' : '↻', onPress: onScan},
     {label:'Dossiers surveillés',    value:'›', onPress: () => Alert.alert('Dossiers surveillés', 'Fonctionnalité à venir.')},
@@ -1885,7 +2013,7 @@ const SleepTimerModal = ({visible, current, onSelect, onClose}: {
 type TrackMenuHandlers = {
   onClose: () => void;
   onPlay: () => void; onPlayNext: () => void; onToggleFav: () => void; onAddPlaylist: () => void;
-  onOpenEq: () => void; onInfo: () => void; onGoAlbum: () => void; onGoArtist: () => void;
+  onOpenEq: () => void; onTagEq: () => void; onInfo: () => void; onGoAlbum: () => void; onGoArtist: () => void;
   onSleep: () => void; onTheme: () => void; onDelete: () => void;
 };
 const TrackMenuSheet = ({track, isFav, h}: {track: any | null; isFav: boolean; h: TrackMenuHandlers}) => {
@@ -1901,6 +2029,7 @@ const TrackMenuSheet = ({track, isFav, h}: {track: any | null; isFav: boolean; h
   ];
   const items = [
     {icon: 'playlist-play', label: 'Lire ensuite', onPress: h.onPlayNext},
+    {icon: 'tag-outline', label: 'Égaliseur (tag)', onPress: h.onTagEq},
     {icon: 'information-outline', label: 'Infos de la piste', onPress: h.onInfo},
     {icon: 'album', label: "Aller à l'album", onPress: h.onGoAlbum},
     {icon: 'account', label: "Aller à l'artiste", onPress: h.onGoArtist},
@@ -1985,6 +2114,12 @@ export default function App() {
   const [playerOpen,   setPlayerOpen]   = useState(false);
   const [eqOpen,       setEqOpen]       = useState(false);
   const [srOpen,       setSrOpen]       = useState(false);
+  // Égaliseurs par tag
+  const {tags: eqTagList, trackTags} = useEqTags();
+  const [tagMgrOpen,   setTagMgrOpen]   = useState(false);
+  const [editingTagId, setEditingTagId] = useState<string | null>(null);
+  const [tagPickTrack, setTagPickTrack] = useState<Track | null>(null);
+  const [tagNaming,    setTagNaming]    = useState<{mode: 'create' | 'rename'; id?: string} | null>(null);
   // Menu 3-points : modales et navigation
   const menuTrack = useTrackMenu();
   const favoritesIds = useFavorites();
@@ -2063,8 +2198,15 @@ export default function App() {
       peqConfigure(bands);
       peqSetEnabled(true);
       setEqBands(bands);
+      // Tags d'égaliseur : on charge les associations et on enregistre l'EQ de
+      // base comme repli. L'EQ effectif est ensuite résolu à chaque morceau.
+      setBaseBands(bands);
+      loadEqTags();
     })().catch(() => {});
   }, []);
+
+  // Tient l'EQ de base d'eqTags synchronisé (repli pour les morceaux sans tag).
+  useEffect(() => { if (eqBands.length) setBaseBands(eqBands); }, [eqBands]);
 
   const persistBands = (bands: PeqBand[]) =>
     AsyncStorage.setItem('pref.peqBands', JSON.stringify(bands)).catch(() => {});
@@ -2188,6 +2330,67 @@ export default function App() {
   }, [srSpeed, srReverb]);
   const srActive = srSpeed !== 1.0 || srReverb > 0;
 
+  // ─── Égaliseurs par tag ───────────────────────────────────────────────────────
+  // Ouverture/fermeture des éditeurs EQ : on prévisualise la courbe visée et on
+  // marque l'édition (suspend l'auto-application), puis on rétablit à la fermeture.
+  const openBaseEq = useCallback(() => {
+    peqConfigure(eqBands); setEqEditing(true); setEqOpen(true);
+  }, [eqBands]);
+  const closeBaseEq = useCallback(() => { setEqOpen(false); setEqEditing(false); }, []);
+
+  const editingTag = editingTagId ? eqTagList.find(t => t.id === editingTagId) ?? null : null;
+  const openTagEq = useCallback((id: string) => {
+    const tag = eqTagList.find(t => t.id === id);
+    if (tag) peqConfigure(tag.bands);
+    setEqEditing(true);
+    setEditingTagId(id);
+  }, [eqTagList]);
+  const closeTagEq = useCallback(() => { setEditingTagId(null); setEqEditing(false); }, []);
+
+  // API d'édition de la courbe d'un tag (réutilise EqualizerScreen).
+  const tagEqApi: EqApi | null = useMemo(() => {
+    if (!editingTag || !peqRange) return null;
+    const tag = editingTag;
+    const commit = (next: PeqBand[]) => updateTagBands(tag.id, next);
+    return {
+      range: peqRange,
+      bands: tag.bands,
+      onGainLive: (i, db) => peqSetGain(i, db),
+      onGainCommit: (i, db) => commit(tag.bands.map((b, idx) => (idx === i ? {...b, gain: db} : b))),
+      onSetFreq: (i, hz) => {
+        const next = tag.bands.map((b, idx) => (idx === i ? {...b, freq: hz} : b)).sort((a, b) => a.freq - b.freq);
+        peqConfigure(next); commit(next);
+      },
+      onAddBand: () => { const next = insertBand(tag.bands); peqConfigure(next); commit(next); },
+      onRemoveBand: (i) => {
+        if (tag.bands.length <= 1) return;
+        const next = tag.bands.filter((_, idx) => idx !== i);
+        peqConfigure(next); commit(next);
+      },
+      onReset: () => { const next = tag.bands.map(b => ({...b, gain: 0})); peqConfigure(next); commit(next); },
+    };
+  }, [editingTag, peqRange]);
+
+  // CRUD tags
+  const submitTagName = useCallback((name: string) => {
+    if (!tagNaming) return;
+    if (tagNaming.mode === 'create') createTag(name, eqBands);   // part de l'EQ de base
+    else if (tagNaming.id) renameTag(tagNaming.id, name);
+    setTagNaming(null);
+  }, [tagNaming, eqBands]);
+  const confirmDeleteTag = useCallback((id: string) => {
+    const tag = eqTagList.find(t => t.id === id);
+    const n = tracksUsingTag(id);
+    Alert.alert(
+      'Supprimer le tag',
+      `Supprimer « ${tag?.name ?? ''} » ?${n > 0 ? `\n${n} morceau${n > 1 ? 'x' : ''} repassera${n > 1 ? 'ont' : ''} sur l'EQ de base.` : ''}`,
+      [
+        {text: 'Annuler', style: 'cancel'},
+        {text: 'Supprimer', style: 'destructive', onPress: () => { if (editingTagId === id) closeTagEq(); deleteTag(id); }},
+      ],
+    );
+  }, [eqTagList, editingTagId, closeTagEq]);
+
   const scan = useCallback(async () => {
     setScanState('scanning');
     const granted = await requestMusicPermission();
@@ -2261,6 +2464,9 @@ export default function App() {
     setPlayerOpen(false);
     setEqOpen(false);
     setSrOpen(false);
+    setTagMgrOpen(false);
+    setEditingTagId(null);
+    setEqEditing(false);
     setPage(0);
     setLibNav({type, value});
   }, []);
@@ -2333,6 +2539,7 @@ export default function App() {
           eq={eq}           setEq={applyEqPreset}
           quality={quality} setQuality={setQualityPref}
           onScan={scan}     scanState={scanState}
+          onOpenTags={() => setTagMgrOpen(true)}
         />
       )}
       <MiniPlayer track={currentTrack} onPress={() => setPlayerOpen(true)}/>
@@ -2349,16 +2556,51 @@ export default function App() {
           track={currentTrack}
           onClose={() => setPlayerOpen(false)}
           eq={{range: peqRange, bands: eqBands, onGainLive, onGainCommit, onSetFreq, onAddBand, onRemoveBand, onReset: onResetBands}}
-          onOpenEq={() => setEqOpen(true)}
+          onOpenEq={openBaseEq}
           onOpenSr={() => setSrOpen(true)}
           srActive={srActive}
         />
       )}
       <EqualizerScreen
         visible={eqOpen}
-        onClose={() => setEqOpen(false)}
+        onClose={closeBaseEq}
         eq={{range: peqRange, bands: eqBands, onGainLive, onGainCommit, onSetFreq, onAddBand, onRemoveBand, onReset: onResetBands}}
         bright={getPalette(currentTrack?.genre).bright}
+      />
+      <EqTagsScreen
+        visible={tagMgrOpen}
+        onClose={() => setTagMgrOpen(false)}
+        tags={eqTagList}
+        trackTags={trackTags}
+        onCreate={() => setTagNaming({mode: 'create'})}
+        onEditEq={openTagEq}
+        onRename={id => setTagNaming({mode: 'rename', id})}
+        onDelete={confirmDeleteTag}
+        bright={getPalette(currentTrack?.genre).bright}
+      />
+      {/* Éditeur de courbe d'un tag (réutilise l'écran EQ) — rendu APRÈS le
+          gestionnaire pour passer au-dessus (frères absolus plein écran). */}
+      <EqualizerScreen
+        visible={!!editingTag && !!tagEqApi}
+        onClose={closeTagEq}
+        eq={tagEqApi ?? {range: peqRange, bands: [], onGainLive: () => {}, onGainCommit: () => {}, onSetFreq: () => {}, onAddBand: () => {}, onRemoveBand: () => {}, onReset: () => {}}}
+        bright={getPalette(currentTrack?.genre).bright}
+        title={editingTag ? `Tag · ${editingTag.name}` : undefined}
+      />
+      <TagPickerSheet
+        visible={!!tagPickTrack}
+        tags={eqTagList}
+        currentTagId={tagPickTrack ? getTrackTagId(tagPickTrack.id) : null}
+        onSelect={tagId => tagPickTrack && setTrackTag(tagPickTrack.id, tagId)}
+        onManage={() => setTagMgrOpen(true)}
+        onClose={() => setTagPickTrack(null)}
+      />
+      <NameModal
+        visible={!!tagNaming}
+        title={tagNaming?.mode === 'rename' ? 'Renommer le tag' : 'Nouveau tag'}
+        initial={tagNaming?.mode === 'rename' ? eqTagList.find(t => t.id === tagNaming.id)?.name : ''}
+        onSubmit={submitTagName}
+        onClose={() => setTagNaming(null)}
       />
       <SlowedReverbScreen
         visible={srOpen}
@@ -2382,7 +2624,8 @@ export default function App() {
           onPlayNext:    () => menuTrack && addNext(menuTrack),
           onToggleFav:   () => menuTrack && toggleFavorite(menuTrack.id),
           onAddPlaylist: () => menuTrack && setAddPlTrackId(menuTrack.id),
-          onOpenEq:      () => setEqOpen(true),
+          onOpenEq:      openBaseEq,
+          onTagEq:       () => menuTrack && setTagPickTrack(menuTrack),
           onInfo:        () => setInfoTrack(menuTrack),
           onGoAlbum:     () => menuTrack && navToCategory('album', menuTrack.album),
           onGoArtist:    () => menuTrack && navToCategory('artist', menuTrack.artist),

@@ -7,6 +7,7 @@ import TrackPlayer, {
   RepeatMode,
 } from 'react-native-track-player';
 import {reapplySpeed} from './slowedReverb';
+import {applyForTrackId} from './eqTags';
 // Hooks re-exportés via require pour contourner le bug exports:[] dans package.json
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const RNTP = require('react-native-track-player');
@@ -118,6 +119,8 @@ export async function setupPlayer() {
   // de ce qui est chargé. Petits ajouts (≤ WINDOW_BATCH), jamais de gros bloc.
   TrackPlayer.addEventListener(Event.PlaybackActiveTrackChanged, () => {
     void maybeExtendWindow();
+    // Applique l'EQ du morceau : son tag s'il en a un, sinon l'EQ de base.
+    void TrackPlayer.getActiveTrack().then(t => applyForTrackId((t as any)?.id ?? null)).catch(() => {});
   });
 
   playerReady = true;
