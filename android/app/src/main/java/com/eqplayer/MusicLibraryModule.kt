@@ -10,7 +10,10 @@ import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
+import android.os.Environment
+import android.provider.DocumentsContract
 import android.provider.MediaStore
+import android.provider.OpenableColumns
 import android.util.Size
 import com.facebook.react.bridge.*
 import java.io.File
@@ -64,11 +67,72 @@ class MusicLibraryModule(reactContext: ReactApplicationContext) :
     // sampleRate/bitDepth en parallèle avant de construire le tableau JS.
     private class Row(
         val id: String, val title: String, val artist: String, val album: String,
-        val albumId: String, var artUri: String, val duration: Double, val filePath: String,
+        val albumId: String, var artUri: String, var duration: Double, val filePath: String,
         val year: String, val format: String, val genre: String, val mime: String,
+        val trackNo: Int, val dateAdded: Double,
     ) {
         var sampleRate = 0
         var bitDepth = 0
+    }
+
+    // Résout l'URI d'un fichier audio ouvert depuis l'explorateur → { id, path }.
+    // id = _ID MediaStore (permet de retrouver la piste scannée) ; path = chemin
+    // absolu best-effort (repli de correspondance par chemin/nom côté JS).
+    @ReactMethod
+    fun resolveAudio(uriStr: String, promise: Promise) {
+        Thread {
+            try {
+                val uri = Uri.parse(uriStr)
+                val path = resolvePath(uri)
+                var id: String? = null
+
+                // 1) URI MediaStore audio directe (…/audio/media/<id>)
+                if (uriStr.contains("/audio/media/")) {
+                    uri.lastPathSegment?.toLongOrNull()?.let { id = it.toString() }
+                }
+                // 2) sinon, on retrouve l'_ID via le chemin (colonne DATA)
+                if (id == null && !path.isNullOrEmpty()) {
+                    reactApplicationContext.contentResolver.query(
+                        MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
+                        arrayOf(MediaStore.Audio.Media._ID),
+                        "${MediaStore.Audio.Media.DATA}=?", arrayOf(path), null
+                    )?.use { if (it.moveToFirst()) id = it.getLong(0).toString() }
+                }
+
+                val res = WritableNativeMap().apply {
+                    putString("id", id)
+                    putString("path", path)
+                }
+                promise.resolve(res)
+            } catch (e: Exception) {
+                promise.resolve(null)
+            }
+        }.start()
+    }
+
+    // Chemin absolu best-effort à partir d'une URI (file://, MediaStore, Documents).
+    private fun resolvePath(uri: Uri): String? {
+        val resolver = reactApplicationContext.contentResolver
+        // file://
+        if (uri.scheme == "file") return uri.path
+        // MediaStore / autres providers exposant DATA
+        try {
+            resolver.query(uri, arrayOf(MediaStore.MediaColumns.DATA), null, null, null)?.use {
+                val col = it.getColumnIndex(MediaStore.MediaColumns.DATA)
+                if (col >= 0 && it.moveToFirst()) it.getString(col)?.let { p -> if (p.isNotEmpty()) return p }
+            }
+        } catch (_: Exception) {}
+        // DocumentsProvider (ex. explorateur système) : docId "primary:Music/x.flac"
+        try {
+            if (DocumentsContract.isDocumentUri(reactApplicationContext, uri)) {
+                val docId = DocumentsContract.getDocumentId(uri)
+                val parts = docId.split(":", limit = 2)
+                if (parts.size == 2 && parts[0].equals("primary", true)) {
+                    return "${Environment.getExternalStorageDirectory()}/${parts[1]}"
+                }
+            }
+        } catch (_: Exception) {}
+        return null
     }
 
     @ReactMethod
@@ -88,6 +152,7 @@ class MusicLibraryModule(reactContext: ReactApplicationContext) :
                     add(MediaStore.Audio.Media.DURATION)
                     add(MediaStore.Audio.Media.DATA)
                     add(MediaStore.Audio.Media.YEAR)
+                    add(MediaStore.Audio.Media.TRACK)
                     add(MediaStore.Audio.Media.MIME_TYPE)
                     add(MediaStore.Audio.Media.DATE_ADDED)
                     add(MediaStore.Audio.Media.SIZE)
@@ -100,7 +165,12 @@ class MusicLibraryModule(reactContext: ReactApplicationContext) :
                     // requête → on lit le taux par fichier via MediaExtractor plus bas.
                 }.toTypedArray()
 
-                val selection = "${MediaStore.Audio.Media.IS_MUSIC} != 0 AND ${MediaStore.Audio.Media.DURATION} > 10000"
+                // On garde les pistes de durée inconnue (NULL) : certaines ROMs
+                // (FiiO) ne calculent pas la durée de certains formats (ex. AIFF)
+                // → on la lira nous-mêmes via MediaExtractor. Sans ça, ces albums
+                // n'apparaissent pas alors qu'ils sont bien indexés.
+                val selection = "${MediaStore.Audio.Media.IS_MUSIC} != 0 AND " +
+                    "(${MediaStore.Audio.Media.DURATION} IS NULL OR ${MediaStore.Audio.Media.DURATION} > 10000)"
                 val sortOrder = "${MediaStore.Audio.Media.TITLE} COLLATE NOCASE ASC"
 
                 val cursor = resolver.query(
@@ -126,6 +196,8 @@ class MusicLibraryModule(reactContext: ReactApplicationContext) :
                     val durationCol   = it.getColumnIndexOrThrow(MediaStore.Audio.Media.DURATION)
                     val dataCol       = it.getColumnIndexOrThrow(MediaStore.Audio.Media.DATA)
                     val yearCol       = it.getColumnIndexOrThrow(MediaStore.Audio.Media.YEAR)
+                    val trackCol      = it.getColumnIndexOrThrow(MediaStore.Audio.Media.TRACK)
+                    val dateAddedCol  = it.getColumnIndexOrThrow(MediaStore.Audio.Media.DATE_ADDED)
                     val mimeCol       = it.getColumnIndexOrThrow(MediaStore.Audio.Media.MIME_TYPE)
                     val genreColIdx   = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R)
                                            it.getColumnIndex(MediaStore.Audio.Media.GENRE)
@@ -151,7 +223,15 @@ class MusicLibraryModule(reactContext: ReactApplicationContext) :
                         // retombe sur l'extension du fichier.
                         val isDsd  = mime.contains("dsd") || mime.contains("dsf") ||
                                      filePath.endsWith(".dsf", true) || filePath.endsWith(".dff", true)
-                        val format = if (isDsd) "DSD" else mimeToFormat(mime)
+                        // AIFF : la ROM FiiO mis-tague certains .aiff en audio/mpeg →
+                        // on se fie à l'extension (fiable) pour router vers le lecteur AIFF.
+                        val isAiff = mime.contains("aiff") || mime.contains("aif") ||
+                                     filePath.endsWith(".aiff", true) || filePath.endsWith(".aif", true)
+                        val format = when {
+                            isDsd  -> "DSD"
+                            isAiff -> "AIFF"
+                            else   -> mimeToFormat(mime)
+                        }
 
                         val genre = when {
                             genreColIdx >= 0 -> it.getString(genreColIdx) ?: ""
@@ -159,6 +239,11 @@ class MusicLibraryModule(reactContext: ReactApplicationContext) :
                         }
 
                         val year = it.getInt(yearCol).let { y -> if (y > 0) y.toString() else "" }
+                        // MediaStore encode le n° de piste en 1000*disque + piste
+                        // (ex. disque 2 piste 5 = 2005). On garde la valeur brute :
+                        // le tri croissant respecte l'ordre disque puis piste.
+                        val trackNo = it.getInt(trackCol)
+                        val dateAdded = it.getLong(dateAddedCol).toDouble() // secondes epoch
 
                         rows.add(Row(
                             id = id.toString(),
@@ -173,6 +258,8 @@ class MusicLibraryModule(reactContext: ReactApplicationContext) :
                             format = format,
                             genre = genre,
                             mime = mime,
+                            trackNo = trackNo,
+                            dateAdded = dateAdded,
                         ))
                     }
                 }
@@ -186,6 +273,11 @@ class MusicLibraryModule(reactContext: ReactApplicationContext) :
                             val (sr, bd) = readAudioFormat(row.filePath)
                             row.sampleRate = sr
                             row.bitDepth = bd
+                            // Durée absente de MediaStore (ex. AIFF sur ROM FiiO) → on
+                            // la lit depuis le fichier pour ne pas afficher 0:00.
+                            if (row.duration <= 0.0 && row.filePath.isNotEmpty()) {
+                                row.duration = readDurationMs(row.filePath)
+                            }
                         }
                     }.forEach { it.get() }
                 } finally {
@@ -216,6 +308,8 @@ class MusicLibraryModule(reactContext: ReactApplicationContext) :
                         putString("mime",     row.mime)
                         putInt("sampleRate",  row.sampleRate)
                         putInt("bitDepth",    row.bitDepth)
+                        putInt("trackNo",     row.trackNo)
+                        putDouble("dateAdded", row.dateAdded)
                     })
                 }
 
@@ -260,6 +354,20 @@ class MusicLibraryModule(reactContext: ReactApplicationContext) :
         return map
     }
 
+    // Durée (ms) depuis le fichier, pour les formats dont MediaStore ne fournit
+    // pas la durée (ex. AIFF sur ROM FiiO). Best-effort : 0 si illisible.
+    private fun readDurationMs(path: String): Double {
+        val mmr = MediaMetadataRetriever()
+        return try {
+            mmr.setDataSource(path)
+            mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toDoubleOrNull() ?: 0.0
+        } catch (_: Exception) {
+            0.0
+        } finally {
+            mmr.release()
+        }
+    }
+
     // Lit (sampleRate Hz, bitDepth bits) depuis l'en-tête du fichier audio.
     // MediaExtractor ne décode pas : il ne parse que le format → rapide.
     // Best-effort : renvoie (0, 0) si illisible (ex. DSD non supporté).
@@ -302,6 +410,10 @@ class MusicLibraryModule(reactContext: ReactApplicationContext) :
     private fun resolveArtwork(rows: List<Row>) {
         val dir = File(reactApplicationContext.filesDir, "albumart").apply { mkdirs() }
 
+        // Map dossier -> id image MediaStore (cover.jpg / folder.jpg…) : repli pour
+        // les fichiers sans pochette embarquée ni vignette (ex. AIFF SoX).
+        val folderArt = buildFolderArtMap()
+
         // Clé de cache d'une ligne : par album si possible, sinon par piste.
         fun keyOf(row: Row): String =
             if (row.albumId.isNotBlank() && row.albumId != "0") "al_${row.albumId}"
@@ -318,7 +430,7 @@ class MusicLibraryModule(reactContext: ReactApplicationContext) :
             repByKey.map { (key, rep) ->
                 pool.submit {
                     val dest = File(dir, "$key.jpg")
-                    val ok = dest.length() > 0 || extractArtwork(rep, dest)
+                    val ok = dest.length() > 0 || extractArtwork(rep, dest, folderArt)
                     if (ok) pathByKey[key] = "file://${dest.absolutePath}"
                 }
             }.forEach { it.get() }
@@ -333,7 +445,7 @@ class MusicLibraryModule(reactContext: ReactApplicationContext) :
     // 1) pochette embarquée dans le fichier (lecture directe, rapide, indépendante
     //    du MediaProvider lent) ; 2) repli sur loadThumbnail (API 29+) pour les
     //    pochettes externes (folder.jpg…). Décodage échantillonné pour la mémoire.
-    private fun extractArtwork(rep: Row, dest: File): Boolean {
+    private fun extractArtwork(rep: Row, dest: File, folderArt: Map<String, Long>): Boolean {
         // 1) Pochette embarquée
         if (rep.filePath.isNotEmpty()) {
             val mmr = MediaMetadataRetriever()
@@ -359,7 +471,50 @@ class MusicLibraryModule(reactContext: ReactApplicationContext) :
                 if (writeJpeg(bmp, dest)) { bmp.recycle(); return true }
             } catch (_: Exception) {}
         }
+        // 3) Image de dossier (cover.jpg / folder.jpg…) via MediaStore.Images.
+        //    Accès direct par chemin refusé (EACCES) → on lit par content:// URI.
+        val parentDir = File(rep.filePath).parent
+        val imgId = parentDir?.let { folderArt[it] }
+        if (imgId != null) {
+            try {
+                val uri = ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, imgId)
+                val bytes = reactApplicationContext.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                if (bytes != null && bytes.isNotEmpty()) {
+                    val bmp = decodeSampled(bytes, 512)
+                    if (bmp != null && writeJpeg(bmp, dest)) { bmp.recycle(); return true }
+                }
+            } catch (_: Exception) {}
+        }
         return false
+    }
+
+    // Map dossier -> id image MediaStore, une image de pochette par dossier.
+    // Priorité aux noms usuels (cover > folder > front > album…), sinon 1re image.
+    private fun buildFolderArtMap(): Map<String, Long> {
+        val priority = listOf("cover", "folder", "front", "album", "albumart", "artwork")
+        val best = HashMap<String, Int>()   // dossier -> meilleur score (plus petit = mieux)
+        val map = HashMap<String, Long>()    // dossier -> id image
+        try {
+            reactApplicationContext.contentResolver.query(
+                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                arrayOf(MediaStore.Images.Media._ID, MediaStore.Images.Media.DATA),
+                null, null, null,
+            )?.use { c ->
+                val idCol = c.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
+                val dataCol = c.getColumnIndexOrThrow(MediaStore.Images.Media.DATA)
+                while (c.moveToNext()) {
+                    val data = c.getString(dataCol) ?: continue
+                    val f = File(data)
+                    val dir = f.parent ?: continue
+                    val base = f.nameWithoutExtension.lowercase()
+                    val r = priority.indexOf(base)
+                    val score = if (r >= 0) r else 100 // noms connus d'abord, sinon n'importe
+                    val cur = best[dir]
+                    if (cur == null || score < cur) { best[dir] = score; map[dir] = c.getLong(idCol) }
+                }
+            }
+        } catch (_: Exception) {}
+        return map
     }
 
     private fun writeJpeg(bmp: Bitmap, dest: File): Boolean = try {
@@ -390,6 +545,8 @@ class MusicLibraryModule(reactContext: ReactApplicationContext) :
         mime.contains("mp3")               -> "MP3"
         mime.contains("ogg")               -> "OGG"
         mime.contains("wav")               -> "WAV"
+        mime.contains("aiff") ||
+        mime.contains("aif")               -> "AIFF"
         mime.contains("opus")              -> "OPUS"
         mime.contains("alac")              -> "ALAC"
         else -> mime.substringAfterLast("/").uppercase().take(5)

@@ -84,6 +84,21 @@ export function removeTrack(id: string, trackId: string) {
   notify();
 }
 
+// Déplace la piste d'index `from` vers l'index `to` dans une playlist (réordonne).
+// Indices exprimés dans p.trackIds (source de vérité), pas dans la liste filtrée.
+export function moveTrack(id: string, from: number, to: number) {
+  playlists = playlists.map(p => {
+    if (p.id !== id) return p;
+    if (from < 0 || from >= p.trackIds.length || to < 0 || to >= p.trackIds.length || from === to) return p;
+    const ids = [...p.trackIds];
+    const [m] = ids.splice(from, 1);
+    ids.splice(to, 0, m);
+    return {...p, trackIds: ids};
+  });
+  persist();
+  notify();
+}
+
 export function toggleTrack(id: string, trackId: string) {
   const pl = playlists.find(p => p.id === id);
   if (!pl) return;

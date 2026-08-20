@@ -3,7 +3,12 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
+    <!-- Pour lire les pochettes de dossier (cover.jpg…) via MediaStore.Images. -->
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+    <!-- Accès « tous les fichiers » : nécessaire pour lire les .lrc voisins des
+         morceaux sur la carte SD (groupe media_rw, non lisibles autrement). -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
 
     <application
       android:name=".MainApplication"
@@ -25,6 +30,26 @@
             <action android:name="android.intent.action.MAIN" />
             <category android:name="android.intent.category.LAUNCHER" />
         </intent-filter>
+        <!-- Ouvrir un fichier audio depuis l'explorateur → proposer EQPlayer. -->
+        <intent-filter android:label="@string/app_name">
+            <action android:name="android.intent.action.VIEW" />
+            <category android:name="android.intent.category.DEFAULT" />
+            <category android:name="android.intent.category.BROWSABLE" />
+            <data android:scheme="content" />
+            <data android:scheme="file" />
+            <data android:mimeType="audio/*" />
+            <data android:mimeType="application/ogg" />
+            <data android:mimeType="application/x-ogg" />
+            <data android:mimeType="application/x-flac" />
+        </intent-filter>
       </activity>
+
+      <!-- Sert les fichiers AIFF comme du WAV à la volée (ExoPlayer ne lit pas
+           l'AIFF nativement). URI : content://com.eqplayer.aiff/<id MediaStore>. -->
+      <provider
+        android:name=".AiffWavProvider"
+        android:authorities="com.eqplayer.aiff"
+        android:exported="false"
+        android:grantUriPermissions="true"/>
     </application>
 </manifest>

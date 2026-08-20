@@ -11,6 +11,7 @@ import {
   Dimensions,
   PanResponder,
   Animated,
+  Easing,
   Image,
   Modal,
   Alert,
@@ -18,6 +19,9 @@ import {
   PermissionsAndroid,
   Platform,
   ActivityIndicator,
+  BackHandler,
+  Linking,
+  AppState,
   useColorScheme,
 } from 'react-native';
 import {SafeAreaView} from 'react-native-safe-area-context';
@@ -25,14 +29,17 @@ import MaterialCommunityIcons from 'react-native-vector-icons/MaterialCommunityI
 import TrackPlayer from 'react-native-track-player';
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const {useActiveTrack} = require('react-native-track-player') as {useActiveTrack: () => import('react-native-track-player').Track | undefined};
-import {setupPlayer, usePlayer, useProgress, playTrack, addNext, seekTo, getUpNext, jumpToIndex, removeFromQueue} from './src/usePlayer';
-import {usePlaylists, createPlaylist, renamePlaylist, deletePlaylist, toggleTrack, removeTrack, type Playlist} from './src/usePlaylists';
+import {setupPlayer, usePlayer, useProgress, playTrack, addNext, seekTo, getUpNext, jumpToIndex, removeFromQueue, moveInQueue, setCrossfadeSec, setReplayGainMode} from './src/usePlayer';
+import type {RgMode} from './src/replayGain';
+import {usePlaylists, createPlaylist, renamePlaylist, deletePlaylist, toggleTrack, removeTrack, moveTrack, type Playlist} from './src/usePlaylists';
 import {useFavorites, toggleFavorite} from './src/useFavorites';
+import {usePlayCounts} from './src/usePlayCounts';
 import {useTrackMenu, openTrackMenu, closeTrackMenu} from './src/useTrackMenu';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import {peqGetInfo, peqConfigure, peqSetGain, peqSetEnabled, presetGainsFor, hzLabel, type PeqBand} from './src/peq';
 import {reverbCheck, setSpeed, setReverb, SR_SPEED_MIN, SR_SPEED_MAX, REVERB_NAMES, SR_PRESETS} from './src/slowedReverb';
 import {useEqTags, loadEqTags, setBaseBands, setEqEditing, createTag, renameTag, updateTagBands, deleteTag, setTrackTag, getTrackTagId, tracksUsingTag, type EqTag} from './src/eqTags';
+import {loadLyrics, lyricsAccessGranted, requestLyricsAccess, activeLineIndex, EMPTY_LYRICS, type Lyrics} from './src/lyrics';
 
 // ─── Thème clair / sombre ───────────────────────────────────────────────────────
 // Tokens sémantiques : seul le « chrome » de l'app est thématisé.
@@ -41,6 +48,7 @@ type Colors = {
   bg: string;        // fond principal
   surface: string;   // cartes, mini-lecteur, feuilles, onglet actif
   surface2: string;  // couvertures de catégorie sans pochette
+  glass: string;     // recherche + mini-lecteur (translucide sombre en thème Flou)
   text: string;      // texte principal
   textDim: string;   // texte secondaire
   textFaint: string; // texte tertiaire
@@ -55,16 +63,32 @@ type Colors = {
 };
 
 const DARK: Colors = {
-  bg:'#000', surface:'#141414', surface2:'#1a1a1a',
+  bg:'#000', surface:'#141414', surface2:'#1a1a1a', glass:'#141414',
   text:'#fff', textDim:'#aaa', textFaint:'#777', textGhost:'#444',
   icon:'#fff', iconDim:'#555', border:'#1c1c1c',
   accent:'#e85d4a', scanBg:'#0d0d0d', barStyle:'light-content', statusBg:'#000',
 };
 const LIGHT: Colors = {
-  bg:'#f7f7f7', surface:'#ffffff', surface2:'#ececec',
+  bg:'#f7f7f7', surface:'#ffffff', surface2:'#ececec', glass:'#ffffff',
   text:'#141414', textDim:'#555', textFaint:'#888', textGhost:'#bbb',
   icon:'#222', iconDim:'#aaa', border:'#e3e3e3',
   accent:'#e85d4a', scanBg:'#ededed', barStyle:'dark-content', statusBg:'#f7f7f7',
+};
+// Thème « Flou » : mêmes teintes sombres que DARK, mais les fonds principaux sont
+// transparents pour laisser voir le backdrop (pochette courante zoomée + floutée)
+// rendu derrière toute l'app. Un voile sombre par-dessus garde le texte lisible.
+const FLOU: Colors = {
+  ...DARK,
+  bg:'transparent', surface:'#141414d9', surface2:'#ffffff14',
+  // scanBg transparent → le bandeau « pistes chargées » montre le backdrop à la
+  // même luminosité que le reste de l'app (pas de voile sombre supplémentaire).
+  border:'#ffffff1f', scanBg:'transparent', statusBg:'transparent',
+  // Textes en blanc (lisibilité sur le backdrop flou) ; hiérarchie via l'alpha.
+  text:'#fff', textDim:'#ffffffd9', textFaint:'#ffffffb3', textGhost:'#ffffff80',
+  icon:'#fff', iconDim:'#ffffff99',
+  // Recherche + mini-lecteur : voile sombre translucide → le flou transparaît
+  // mais plus assombri (moins lumineux) que le backdrop, pour les détacher.
+  glass:'#000000a6',
 };
 
 const ThemeCtx = React.createContext<Colors>(DARK);
@@ -84,10 +108,48 @@ const useStyles = () => stylesFor(useColors());
 
 // ─── Module natif MusicLibrary ────────────────────────────────────────────────
 const {MusicLibrary} = NativeModules as {
-  MusicLibrary: {getTracks: () => Promise<Track[]>};
+  MusicLibrary: {
+    getTracks: () => Promise<Track[]>;
+    resolveAudio: (uri: string) => Promise<{id: string | null; path: string | null} | null>;
+  };
 };
 
 const {width} = Dimensions.get('window');
+
+// ─── Retour Android (pile de navigation maison) ───────────────────────────────
+// Chaque écran/overlay enregistre un handler avec une priorité. Au retour (bouton
+// ou geste), on appelle le handler actif de plus haute priorité ; le premier qui
+// renvoie true « consomme » le retour. Si aucun ne consomme → comportement par
+// défaut (quitter l'app). Le tri par priorité rend l'ordre indépendant de l'ordre
+// de montage des composants (contrairement au LIFO brut de BackHandler).
+type BackEntry = {priority: number; handler: () => boolean};
+const backRegistry: BackEntry[] = [];
+let backInstalled = false;
+function ensureBackDispatcher() {
+  if (backInstalled) return;
+  backInstalled = true;
+  BackHandler.addEventListener('hardwareBackPress', () => {
+    for (const e of [...backRegistry].sort((a, b) => b.priority - a.priority)) {
+      if (e.handler()) return true;
+    }
+    return false;
+  });
+}
+// Priorités : plus haut = traité en premier (overlay/ modale au-dessus de tout).
+const BACK = {MODAL: 100, TAG_EQ: 96, EQ: 94, TAG_MGR: 92, LYRICS: 91, PLAYER: 90, SEARCH: 60, DRILL: 50, TAB: 10};
+function useBackHandler(priority: number, handler: () => boolean) {
+  const ref = useRef(handler);
+  ref.current = handler;
+  useEffect(() => {
+    ensureBackDispatcher();
+    const entry: BackEntry = {priority, handler: () => ref.current()};
+    backRegistry.push(entry);
+    return () => {
+      const i = backRegistry.indexOf(entry);
+      if (i >= 0) backRegistry.splice(i, 1);
+    };
+  }, [priority]);
+}
 
 // ─── Palettes par genre ───────────────────────────────────────────────────────
 type Palette = {dark: string; mid: string; bright: string; cover: string};
@@ -146,6 +208,8 @@ type Track = {
   mime?:    string;
   sampleRate?: number;  // Hz (0 si inconnu)
   bitDepth?:   number;  // bits (0 si inconnu)
+  trackNo?:    number;  // n° de piste (1000*disque + piste), 0 si inconnu
+  dateAdded?:  number;  // date d'ajout (secondes epoch), pour « Ajoutés »
 };
 
 // Regroupe un morceau par qualité audio (taux d'échantillonnage, ou DSDxxx).
@@ -446,43 +510,77 @@ type EqApi = {
   onReset: () => void;
 };
 
+const SCREEN_H = Dimensions.get('window').height;
+
+// Overlay plein écran qui glisse depuis le bas à l'ouverture et ressort par le
+// bas à la fermeture. `render` garde les enfants montés le temps de l'animation
+// de sortie. Mouvement identique au lecteur pour une cohérence visuelle.
+const SlideUpScreen = ({visible, children, style}: {
+  visible: boolean; children: React.ReactNode; style?: any;
+}) => {
+  const y = useRef(new Animated.Value(SCREEN_H)).current;
+  const [render, setRender] = useState(visible);
+  useEffect(() => {
+    if (visible) {
+      setRender(true);
+      y.stopAnimation();
+      Animated.spring(y, {toValue: 0, useNativeDriver: true, bounciness: 3, speed: 13}).start();
+    } else {
+      Animated.timing(y, {
+        toValue: SCREEN_H, duration: 220,
+        easing: Easing.in(Easing.cubic), useNativeDriver: true,
+      }).start(({finished}) => { if (finished) setRender(false); });
+    }
+  }, [visible, y]);
+  if (!render) return null;
+  return (
+    <Animated.View
+      style={[{position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, transform: [{translateY: y}]}, style]}>
+      {children}
+    </Animated.View>
+  );
+};
+
 // Page égaliseur plein écran : aucune ScrollView parente → les sliders ne
 // rentrent jamais en conflit avec le défilement de la page.
 const EqualizerScreen = ({visible, onClose, eq, bright, title}: {
   visible: boolean; onClose: () => void; eq: EqApi; bright: string; title?: string;
 }) => {
-  if (!visible || !eq.range) return null;
   return (
-    <View style={eqScrS.root}>
-      <StatusBar barStyle="light-content" backgroundColor="#0a0a0d"/>
-      <View style={eqScrS.header}>
-        <TouchableOpacity onPress={onClose} style={eqScrS.hBtn}>
-          <MaterialCommunityIcons name="chevron-down" size={28} color="#fff"/>
-        </TouchableOpacity>
-        <Text style={eqScrS.title} numberOfLines={1}>{title ?? 'Égaliseur'}</Text>
-        <TouchableOpacity onPress={eq.onReset} style={eqScrS.resetBtn}>
-          <Text style={eqScrS.resetTxt}>Réinitialiser</Text>
-        </TouchableOpacity>
-        <TouchableOpacity onPress={eq.onAddBand} style={eqScrS.hBtn}>
-          <MaterialCommunityIcons name="plus-circle-outline" size={24} color={bright}/>
-        </TouchableOpacity>
-      </View>
-      <View style={eqScrS.body}>
-        <ParametricEq
-          bands={eq.bands}
-          minDb={eq.range.minDb}
-          maxDb={eq.range.maxDb}
-          bright={bright}
-          onGainLive={eq.onGainLive}
-          onGainCommit={eq.onGainCommit}
-          onSetFreq={eq.onSetFreq}
-          onRemoveBand={eq.onRemoveBand}
-          onDragStart={() => {}}
-          onDragEnd={() => {}}
-        />
-        <Text style={eqScrS.hint}>Glisse une bande pour le gain · touche une fréquence pour la modifier · + pour ajouter une bande</Text>
-      </View>
-    </View>
+    <SlideUpScreen visible={visible && !!eq.range}>
+      {eq.range && (
+        <View style={eqScrS.root}>
+          <StatusBar barStyle="light-content" backgroundColor="#0a0a0d"/>
+          <View style={eqScrS.header}>
+            <TouchableOpacity onPress={onClose} style={eqScrS.hBtn}>
+              <MaterialCommunityIcons name="chevron-down" size={28} color="#fff"/>
+            </TouchableOpacity>
+            <Text style={eqScrS.title} numberOfLines={1}>{title ?? 'Égaliseur'}</Text>
+            <TouchableOpacity onPress={eq.onReset} style={eqScrS.resetBtn}>
+              <Text style={eqScrS.resetTxt}>Réinitialiser</Text>
+            </TouchableOpacity>
+            <TouchableOpacity onPress={eq.onAddBand} style={eqScrS.hBtn}>
+              <MaterialCommunityIcons name="plus-circle-outline" size={24} color={bright}/>
+            </TouchableOpacity>
+          </View>
+          <View style={eqScrS.body}>
+            <ParametricEq
+              bands={eq.bands}
+              minDb={eq.range.minDb}
+              maxDb={eq.range.maxDb}
+              bright={bright}
+              onGainLive={eq.onGainLive}
+              onGainCommit={eq.onGainCommit}
+              onSetFreq={eq.onSetFreq}
+              onRemoveBand={eq.onRemoveBand}
+              onDragStart={() => {}}
+              onDragEnd={() => {}}
+            />
+            <Text style={eqScrS.hint}>Glisse une bande pour le gain · touche une fréquence pour la modifier · + pour ajouter une bande</Text>
+          </View>
+        </View>
+      )}
+    </SlideUpScreen>
   );
 };
 
@@ -509,8 +607,8 @@ const EqTagsScreen = ({visible, onClose, tags, trackTags, onCreate, onEditEq, on
   onRename: (id: string) => void; onDelete: (id: string) => void;
   bright: string;
 }) => {
-  if (!visible) return null;
   return (
+    <SlideUpScreen visible={visible}>
     <View style={eqScrS.root}>
       <StatusBar barStyle="light-content" backgroundColor="#0a0a0d"/>
       <View style={eqScrS.header}>
@@ -554,6 +652,7 @@ const EqTagsScreen = ({visible, onClose, tags, trackTags, onCreate, onEditEq, on
         </ScrollView>
       )}
     </View>
+    </SlideUpScreen>
   );
 };
 
@@ -848,23 +947,158 @@ const PlayerProgress = ({bright}: {bright: string}) => {
   );
 };
 
+// ─── Paroles (.lrc) ───────────────────────────────────────────────────────────
+// Écran plein écran qui suit le morceau actif : vue « karaoké » synchronisée si
+// le .lrc est horodaté (ligne active surlignée + centrée, toucher pour se caler),
+// sinon texte brut. Demande l'accès « tous les fichiers » si nécessaire.
+const LyricsScreen = ({visible, track, onClose, bright}: {
+  visible: boolean; track: Track | null; onClose: () => void; bright: string;
+}) => {
+  const activeTrack = useActiveTrack();
+  const path = (activeTrack as any)?.filePath ?? (track as any)?.filePath ?? null;
+  const [lyrics, setLyrics]   = useState<Lyrics>(EMPTY_LYRICS);
+  const [granted, setGranted] = useState(true);
+  const [loading, setLoading] = useState(false);
+  const {position} = useProgress(250); // ~4 rafraîchissements/s pour le surlignage
+
+  // Charge (accès + .lrc) pour le morceau courant. Un compteur ignore les
+  // résolutions périmées (changement de morceau pendant le chargement).
+  const loadSeq = useRef(0);
+  const load = useCallback(async () => {
+    const seq = ++loadSeq.current;
+    const ok = await lyricsAccessGranted();
+    if (seq !== loadSeq.current) return;
+    setGranted(ok);
+    if (!ok) { setLyrics(EMPTY_LYRICS); return; }
+    setLoading(true);
+    const l = await loadLyrics(path);
+    if (seq === loadSeq.current) { setLyrics(l); setLoading(false); }
+  }, [path]);
+
+  useEffect(() => { if (visible) load(); }, [visible, load]);
+
+  // Re-vérifie au retour de premier plan : l'utilisateur revient d'accorder
+  // l'accès « tous les fichiers » dans les réglages système.
+  useEffect(() => {
+    if (!visible) return;
+    const sub = AppState.addEventListener('change', s => { if (s === 'active') load(); });
+    return () => sub.remove();
+  }, [visible, load]);
+
+  const active = lyrics.synced ? activeLineIndex(lyrics.lines, position) : -1;
+
+  // Auto-défilement : garde la ligne active à ~38 % du haut. Suspendu 4 s après
+  // un défilement manuel (pour laisser lire en avant sans être ramené).
+  const scrollRef = useRef<ScrollView>(null);
+  const offsets = useRef<number[]>([]);
+  const userScrollUntil = useRef(0);
+  useEffect(() => {
+    if (active < 0 || !lyrics.synced) return;
+    if (Date.now() < userScrollUntil.current) return;
+    const y = offsets.current[active];
+    if (y != null) scrollRef.current?.scrollTo({y: Math.max(0, y - SCREEN_H * 0.38), animated: true});
+  }, [active, lyrics.synced]);
+
+  return (
+    <SlideUpScreen visible={visible}>
+      <View style={lyrS.root}>
+        <StatusBar barStyle="light-content" backgroundColor="#0a0a0d"/>
+        <View style={lyrS.header}>
+          <TouchableOpacity onPress={onClose} style={lyrS.hBtn}>
+            <MaterialCommunityIcons name="chevron-down" size={28} color="#fff"/>
+          </TouchableOpacity>
+          <Text style={lyrS.title} numberOfLines={1}>Paroles</Text>
+          <View style={lyrS.hBtn}/>
+        </View>
+        {!granted ? (
+          <View style={lyrS.center}>
+            <MaterialCommunityIcons name="lock-outline" size={48} color="#ffffff22"/>
+            <Text style={lyrS.msg}>Pour afficher les paroles, autorise l'accès aux fichiers : l'app doit lire les .lrc posés à côté de tes morceaux.</Text>
+            <TouchableOpacity style={[lyrS.grantBtn, {backgroundColor: bright}]} onPress={requestLyricsAccess}>
+              <Text style={lyrS.grantTxt}>Autoriser l'accès</Text>
+            </TouchableOpacity>
+            <Text style={lyrS.hint}>Puis reviens sur cet écran.</Text>
+          </View>
+        ) : loading ? (
+          <View style={lyrS.center}><ActivityIndicator color={bright}/></View>
+        ) : lyrics.synced ? (
+          <ScrollView ref={scrollRef} contentContainerStyle={lyrS.scroll} showsVerticalScrollIndicator={false}
+            onScrollBeginDrag={() => { userScrollUntil.current = Date.now() + 4000; }}>
+            {lyrics.lines.map((ln, i) => (
+              <TouchableOpacity key={i} activeOpacity={0.6}
+                onLayout={e => { offsets.current[i] = e.nativeEvent.layout.y; }}
+                onPress={() => seekTo(ln.time)}>
+                <Text style={[lyrS.line, i === active && {color: bright, fontWeight: '700'}]}>{ln.text}</Text>
+              </TouchableOpacity>
+            ))}
+          </ScrollView>
+        ) : lyrics.plain.length ? (
+          <ScrollView contentContainerStyle={lyrS.scroll} showsVerticalScrollIndicator={false}>
+            {lyrics.plain.map((ln, i) => <Text key={i} style={lyrS.linePlain}>{ln}</Text>)}
+          </ScrollView>
+        ) : (
+          <View style={lyrS.center}>
+            <MaterialCommunityIcons name="music-note-off-outline" size={48} color="#ffffff22"/>
+            <Text style={lyrS.msg}>Pas de paroles pour ce morceau.</Text>
+          </View>
+        )}
+      </View>
+    </SlideUpScreen>
+  );
+};
+
+const lyrS = StyleSheet.create({
+  root:     {position:'absolute', top:0, left:0, right:0, bottom:0, backgroundColor:'#0a0a0d'},
+  header:   {flexDirection:'row', alignItems:'center', paddingTop:52, paddingHorizontal:12, paddingBottom:8},
+  hBtn:     {padding:6, width:40},
+  title:    {flex:1, color:'#fff', fontSize:20, fontWeight:'700', marginLeft:4},
+  center:   {flex:1, alignItems:'center', justifyContent:'center', paddingHorizontal:36, gap:16},
+  msg:      {color:'#ffffff88', fontSize:14, textAlign:'center', lineHeight:20},
+  hint:     {color:'#ffffff55', fontSize:12, textAlign:'center'},
+  grantBtn: {paddingHorizontal:22, paddingVertical:11, borderRadius:22},
+  grantTxt: {color:'#111', fontSize:14, fontWeight:'700'},
+  scroll:   {paddingHorizontal:24, paddingTop:SCREEN_H*0.28, paddingBottom:SCREEN_H*0.5},
+  line:     {color:'#ffffff55', fontSize:19, fontWeight:'600', lineHeight:40, textAlign:'center'},
+  linePlain:{color:'#ffffffcc', fontSize:16, lineHeight:28, textAlign:'center'},
+});
+
 // ─── Player ───────────────────────────────────────────────────────────────────
-const PlayerScreen = ({track, onClose, eq, onOpenEq, onOpenSr, srActive}: {
-  track: Track; onClose: () => void;
-  eq: EqApi; onOpenEq: () => void; onOpenSr: () => void; srActive: boolean;
+const PlayerScreen = ({track, visible, onClose, eq, onOpenEq, onOpenSr, onOpenLyrics, srActive, blurBg}: {
+  track: Track; visible: boolean; onClose: () => void;
+  eq: EqApi; onOpenEq: () => void; onOpenSr: () => void; onOpenLyrics: () => void; srActive: boolean;
+  blurBg?: boolean;
 }) => {
   const [addOpen,   setAddOpen]   = useState(false);
   const favorites = useFavorites();
+
+  // Transition d'ouverture/fermeture : le lecteur glisse depuis le bas et
+  // ressort par le bas. `render` garde le composant monté le temps de
+  // l'animation de sortie ; la même valeur `dragY` sert au geste de fermeture.
+  const dragY = useRef(new Animated.Value(SCREEN_H)).current;
+  const [render, setRender] = useState(visible);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+  useEffect(() => {
+    if (visible) {
+      setRender(true);
+      dragY.stopAnimation();
+      Animated.spring(dragY, {
+        toValue: 0, useNativeDriver: true, bounciness: 3, speed: 13,
+      }).start();
+    } else {
+      Animated.timing(dragY, {
+        toValue: SCREEN_H, duration: 220,
+        easing: Easing.in(Easing.cubic), useNativeDriver: true,
+      }).start(({finished}) => { if (finished) setRender(false); });
+    }
+  }, [visible, dragY]);
 
   // Geste « glisser vers le bas pour fermer » : tout le lecteur suit le doigt,
   // se ferme au-delà d'un seuil (ou d'un flick rapide), sinon revient en place.
   // Le geste vit sur un CALQUE transparent posé SUR la cover (frère de la
   // ScrollView, donc au-dessus) : la ScrollView native ne peut pas avaler le
   // drag. Le calque n'est actif que quand la liste est tout en haut (atTop).
-  const dragY = useRef(new Animated.Value(0)).current;
   const [atTop, setAtTop] = useState(true);
-  const onCloseRef = useRef(onClose);
-  onCloseRef.current = onClose;
   const dismissPan = useRef(
     PanResponder.create({
       // Pas de onStartShouldSet… : sinon le calque avalerait aussi le scroll
@@ -873,11 +1107,10 @@ const PlayerScreen = ({track, onClose, eq, onOpenEq, onOpenSr, srActive}: {
       onMoveShouldSetPanResponder: (_, g) => g.dy > 6 && g.dy > Math.abs(g.dx),
       onPanResponderMove: (_, g) => { if (g.dy > 0) dragY.setValue(g.dy); },
       onPanResponderRelease: (_, g) => {
+        // Au-delà du seuil (ou flick) → on demande la fermeture : l'effet
+        // `visible` prend le relais et termine le glissement vers le bas.
         if (g.dy > 120 || g.vy > 1.2) {
-          Animated.timing(dragY, {
-            toValue: Dimensions.get('window').height,
-            duration: 200, useNativeDriver: true,
-          }).start(() => onCloseRef.current());
+          onCloseRef.current();
         } else {
           Animated.spring(dragY, {toValue: 0, useNativeDriver: true, bounciness: 4}).start();
         }
@@ -899,16 +1132,21 @@ const PlayerScreen = ({track, onClose, eq, onOpenEq, onOpenSr, srActive}: {
     } catch { /* lecteur pas prêt */ }
   }, []);
   useEffect(() => {
+    if (!visible) return; // inutile de rafraîchir la file quand le lecteur est fermé
     refreshQueue();
     const t = setTimeout(refreshQueue, 400); // au cas où la file vient d'être (re)construite
     return () => clearTimeout(t);
-  }, [activeTrack, isPlaying, refreshQueue]);
+  }, [visible, activeTrack, isPlaying, refreshQueue]);
 
   const jumpTo = useCallback(async (index: number) => {
     await jumpToIndex(index);
   }, []);
   const removeAt = useCallback(async (index: number) => {
     await removeFromQueue(index);
+    refreshQueue();
+  }, [refreshQueue]);
+  const moveAt = useCallback(async (from: number, to: number) => {
+    await moveInQueue(from, to);
     refreshQueue();
   }, [refreshQueue]);
 
@@ -929,11 +1167,23 @@ const PlayerScreen = ({track, onClose, eq, onOpenEq, onOpenSr, srActive}: {
     shuffle:      'shuffle-variant',
   }[playMode] ?? 'repeat');
 
+  if (!render) return null;
+
   return (
     <Animated.View
-      style={[pS.root, {backgroundColor:palette.dark, transform:[{translateY: dragY}]}]}>
-      <View style={[pS.blob1, {backgroundColor:palette.mid+'99'}]}/>
-      <View style={[pS.blob2, {backgroundColor:palette.bright+'22'}]}/>
+      style={[pS.root, {backgroundColor: blurBg ? '#000' : palette.dark, transform:[{translateY: dragY}]}]}>
+      {blurBg && coverUri ? (
+        // Fond « Flou » : la pochette du morceau, zoomée + floutée, + voile sombre.
+        <>
+          <Image source={{uri: coverUri}} blurRadius={45} resizeMode="cover" style={pS.blurBg}/>
+          <View style={[pS.blurBg, {backgroundColor:'#00000080'}]}/>
+        </>
+      ) : (
+        <>
+          <View style={[pS.blob1, {backgroundColor:palette.mid+'99'}]}/>
+          <View style={[pS.blob2, {backgroundColor:palette.bright+'22'}]}/>
+        </>
+      )}
       <StatusBar barStyle="light-content" backgroundColor="transparent" translucent/>
 
       {/* Top bar */}
@@ -942,6 +1192,9 @@ const PlayerScreen = ({track, onClose, eq, onOpenEq, onOpenSr, srActive}: {
           <MaterialCommunityIcons name="chevron-down" size={28} color="#fff"/>
         </TouchableOpacity>
         <Text style={pS.topTitle}>En lecture</Text>
+        <TouchableOpacity style={pS.topBtn} onPress={onOpenLyrics}>
+          <MaterialCommunityIcons name="text" size={24} color="#fff"/>
+        </TouchableOpacity>
         <TouchableOpacity style={pS.topBtn} onPress={() => openTrackMenu(track)}>
           <MaterialCommunityIcons name="dots-vertical" size={24} color="#fff"/>
         </TouchableOpacity>
@@ -1040,7 +1293,7 @@ const PlayerScreen = ({track, onClose, eq, onOpenEq, onOpenSr, srActive}: {
           <Text style={pS.sectionTitle}>File d'attente</Text>
           {upNext.length === 0 ? (
             <Text style={[pS.timeText, {paddingVertical:12}]}>Aucun morceau à suivre.</Text>
-          ) : upNext.map(t => (
+          ) : upNext.map((t, i) => (
             <TouchableOpacity key={t._sIndex} style={pS.queueRow} activeOpacity={0.7} onPress={() => jumpTo(t._sIndex)}>
               {(t.artwork ?? t.artUri) ? (
                 <Image source={{uri: t.artwork ?? t.artUri}} style={pS.queueCover} resizeMode="cover"/>
@@ -1053,6 +1306,12 @@ const PlayerScreen = ({track, onClose, eq, onOpenEq, onOpenSr, srActive}: {
                 <Text style={pS.queueTitle} numberOfLines={1}>{t.title}</Text>
                 <Text style={pS.queueArtist} numberOfLines={1}>{t.artist}</Text>
               </View>
+              <TouchableOpacity disabled={i === 0} onPress={() => moveAt(t._sIndex, t._sIndex - 1)} style={pS.queueMove}>
+                <MaterialCommunityIcons name="chevron-up" size={20} color={i === 0 ? '#ffffff22' : '#ffffff77'}/>
+              </TouchableOpacity>
+              <TouchableOpacity disabled={i === upNext.length - 1} onPress={() => moveAt(t._sIndex, t._sIndex + 1)} style={pS.queueMove}>
+                <MaterialCommunityIcons name="chevron-down" size={20} color={i === upNext.length - 1 ? '#ffffff22' : '#ffffff77'}/>
+              </TouchableOpacity>
               <TouchableOpacity onPress={() => removeAt(t._sIndex)} style={pS.queueRemove}>
                 <MaterialCommunityIcons name="close" size={16} color="#555"/>
               </TouchableOpacity>
@@ -1079,6 +1338,7 @@ const PlayerScreen = ({track, onClose, eq, onOpenEq, onOpenSr, srActive}: {
 
 const pS = StyleSheet.create({
   root:          {flex:1, position:'absolute', inset:0},
+  blurBg:        {position:'absolute', top:0, left:0, right:0, bottom:0},
   blob1:         {position:'absolute', top:-100, right:-100, width:300, height:300, borderRadius:150},
   blob2:         {position:'absolute', bottom:100, left:-80, width:250, height:250, borderRadius:125},
   topBar:        {flexDirection:'row', alignItems:'center', justifyContent:'space-between', paddingHorizontal:16, paddingTop:52, paddingBottom:8},
@@ -1115,6 +1375,7 @@ const pS = StyleSheet.create({
   queueMeta:     {flex:1},
   queueTitle:    {fontSize:13, fontWeight:'500', color:'#fff'},
   queueArtist:   {fontSize:11, color:'#ffffff55', marginTop:1},
+  queueMove:     {paddingHorizontal:2, paddingVertical:6},
   queueRemove:   {padding:8},
   overlay:       {position:'absolute', top:0, left:0, right:0, bottom:0, backgroundColor:'#000000aa', justifyContent:'flex-end', zIndex:200},
   sheet:         {backgroundColor:'#111', borderTopLeftRadius:16, borderTopRightRadius:16, paddingTop:8, paddingBottom:32},
@@ -1123,11 +1384,12 @@ const pS = StyleSheet.create({
 });
 
 // ─── TrackRow (liste) ─────────────────────────────────────────────────────────
-const TrackRow = ({track, onPress, onDots, dotsIcon, dotsColor}: {track: any; onPress?: () => void; onDots?: () => void; dotsIcon?: string; dotsColor?: string}) => {
+const TrackRow = ({track, onPress, onDots, dotsIcon, dotsColor, count, onMoveUp, onMoveDown, canMoveUp, canMoveDown}: {track: any; onPress?: () => void; onDots?: () => void; dotsIcon?: string; dotsColor?: string; count?: number; onMoveUp?: () => void; onMoveDown?: () => void; canMoveUp?: boolean; canMoveDown?: boolean}) => {
   const {S} = useStyles();
   const c = useColors();
   return (
-  <TouchableOpacity style={S.row} activeOpacity={0.7} onPress={onPress}>
+  <TouchableOpacity style={S.row} activeOpacity={0.7} onPress={onPress}
+    onLongPress={() => openTrackMenu(track)} delayLongPress={300}>
     {track.artUri ? (
       <Image source={{uri: track.artUri}} style={S.rowCover} resizeMode="cover"/>
     ) : (
@@ -1139,7 +1401,23 @@ const TrackRow = ({track, onPress, onDots, dotsIcon, dotsColor}: {track: any; on
       <Text style={S.rowTitle} numberOfLines={1}>{track.title}</Text>
       <Text style={S.rowSub}   numberOfLines={1}>{track.artist}</Text>
     </View>
+    {typeof count === 'number' && (
+      <View style={S.playCountBadge}>
+        <MaterialCommunityIcons name="play" size={11} color={c.textDim}/>
+        <Text style={S.playCountText}>{count}</Text>
+      </View>
+    )}
     {track.format ? <Text style={S.rowFormat}>{track.format}</Text> : null}
+    {onMoveUp && (
+      <TouchableOpacity disabled={canMoveUp === false} style={S.rowMove} onPress={onMoveUp}>
+        <MaterialCommunityIcons name="chevron-up" size={20} color={canMoveUp === false ? c.iconDim + '55' : c.icon}/>
+      </TouchableOpacity>
+    )}
+    {onMoveDown && (
+      <TouchableOpacity disabled={canMoveDown === false} style={S.rowMove} onPress={onMoveDown}>
+        <MaterialCommunityIcons name="chevron-down" size={20} color={canMoveDown === false ? c.iconDim + '55' : c.icon}/>
+      </TouchableOpacity>
+    )}
     <TouchableOpacity style={S.rowDots} onPress={onDots ?? (() => openTrackMenu(track))}>
       <MaterialCommunityIcons name={(dotsIcon ?? 'dots-vertical') as any} size={18} color={dotsColor ?? c.iconDim}/>
     </TouchableOpacity>
@@ -1236,9 +1514,12 @@ const letterOf = (s: string) => {
   return ch >= 'A' && ch <= 'Z' ? ch : '#';
 };
 
-const IndexedList = ({data, getName, renderItem, keyExtractor}: {
+const IndexedList = ({data, getName, renderItem, keyExtractor, initialOffset = 0, onOffset}: {
   data: any[]; getName: (item: any) => string;
   renderItem: (info: {item: any}) => React.ReactElement; keyExtractor: (item: any) => string;
+  // Offset de scroll initial + rappel à chaque scroll : permet de restaurer la
+  // position quand la liste est démontée puis remontée (ex. retour d'un drill).
+  initialOffset?: number; onOffset?: (y: number) => void;
 }) => {
   const c = useColors();
   const listRef = useRef<FlatList<any>>(null);
@@ -1301,6 +1582,9 @@ const IndexedList = ({data, getName, renderItem, keyExtractor}: {
         removeClippedSubviews
         getItemLayout={(_, i) => ({length: ROW_H, offset: ROW_H * i, index: i})}
         onScrollToIndexFailed={() => {}}
+        contentOffset={{x: 0, y: initialOffset}}
+        onScroll={onOffset ? e => onOffset(e.nativeEvent.contentOffset.y) : undefined}
+        scrollEventThrottle={16}
       />
       <View style={alphaS.bar} onLayout={e => setBarH(e.nativeEvent.layout.height)} {...pan.panHandlers}>
         {ALPHA.map(L => (
@@ -1319,8 +1603,9 @@ const alphaS = StyleSheet.create({
 });
 
 // ─── Toolbar ──────────────────────────────────────────────────────────────────
-const Toolbar = ({count, label, view, onView, onPlayAll}: {
+const Toolbar = ({count, label, view, onView, onPlayAll, onSort, sortActive}: {
   count: number; label: string; view: ViewMode; onView: (v: ViewMode) => void; onPlayAll?: () => void;
+  onSort?: () => void; sortActive?: boolean;
 }) => {
   const {S} = useStyles();
   const c = useColors();
@@ -1338,11 +1623,8 @@ const Toolbar = ({count, label, view, onView, onPlayAll}: {
         <MaterialCommunityIcons name="view-grid" size={20} color={view==='grid'?c.icon:c.iconDim}/>
       </TouchableOpacity>
       <View style={S.tbDivider}/>
-      <TouchableOpacity style={S.tbBtn}>
-        <MaterialCommunityIcons name="sort" size={20} color={c.iconDim}/>
-      </TouchableOpacity>
-      <TouchableOpacity style={S.tbBtn}>
-        <MaterialCommunityIcons name="dots-vertical" size={20} color={c.iconDim}/>
+      <TouchableOpacity style={S.tbBtn} onPress={onSort} disabled={!onSort}>
+        <MaterialCommunityIcons name="sort" size={20} color={sortActive ? c.accent : c.iconDim}/>
       </TouchableOpacity>
     </View>
   </View>
@@ -1362,6 +1644,67 @@ const EmptyState = ({msg, sub}: {msg: string; sub: string}) => {
 // ─── Library Page ─────────────────────────────────────────────────────────────
 type CatItem = {name: string; sub: string; id: string; artUri?: string; filter: (t: Track) => boolean};
 
+// Ordre des pistes d'un album : par n° de piste (métadonnées) plutôt qu'alphabétique.
+// trackNo encode 1000*disque + piste → le tri croissant respecte disque puis piste.
+// Les pistes sans n° (0) passent après, triées par titre.
+const sortAlbumTracks = (list: Track[]): Track[] =>
+  [...list].sort((a, b) => {
+    const na = a.trackNo ?? 0, nb = b.trackNo ?? 0;
+    if (na && nb) return na - nb;
+    if (na) return -1;
+    if (nb) return 1;
+    return a.title.localeCompare(b.title);
+  });
+
+// ─── Options de tri ───────────────────────────────────────────────────────────
+const cmpStr = (a?: string, b?: string) => (a ?? '').localeCompare(b ?? '');
+type SortDef<T> = {key: string; label: string; cmp: (a: T, b: T) => number};
+
+// Tris pour les listes de pistes (Titres, album, favoris, etc.).
+const TRACK_SORTS: SortDef<Track>[] = [
+  {key:'title',      label:'Titre (A→Z)',            cmp:(a,b)=>cmpStr(a.title,b.title)},
+  {key:'title_d',    label:'Titre (Z→A)',            cmp:(a,b)=>cmpStr(b.title,a.title)},
+  {key:'artist',     label:'Artiste',                cmp:(a,b)=>cmpStr(a.artist,b.artist)||cmpStr(a.title,b.title)},
+  {key:'album',      label:'Album',                  cmp:(a,b)=>cmpStr(a.album,b.album)||((a.trackNo??0)-(b.trackNo??0))},
+  {key:'duration',   label:'Durée (courte → longue)',cmp:(a,b)=>(a.duration??0)-(b.duration??0)},
+  {key:'duration_d', label:'Durée (longue → courte)',cmp:(a,b)=>(b.duration??0)-(a.duration??0)},
+];
+// Tris pour les listes de catégories (albums, artistes, genres…).
+const CAT_SORTS: SortDef<CatItem>[] = [
+  {key:'name',   label:'Nom (A→Z)', cmp:(a,b)=>cmpStr(a.name,b.name)},
+  {key:'name_d', label:'Nom (Z→A)', cmp:(a,b)=>cmpStr(b.name,a.name)},
+];
+// Applique un tri (par clé) à une liste ; clé nulle/inconnue → ordre inchangé.
+function applySort<T>(list: T[], defs: SortDef<T>[], key: string | null): T[] {
+  const s = key ? defs.find(d => d.key === key) : null;
+  return s ? [...list].sort(s.cmp) : list;
+}
+
+// Feuille de sélection du tri (réutilise le style des sheets de réglages).
+const SortSheet = ({visible, title, options, current, onSelect, onClose}: {
+  visible: boolean; title: string; options: {key: string; label: string}[];
+  current: string | null; onSelect: (key: string) => void; onClose: () => void;
+}) => {
+  const {setS} = useStyles();
+  const c = useColors();
+  return (
+    <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
+      <TouchableOpacity style={setS.backdrop} activeOpacity={1} onPress={onClose}>
+        <View style={setS.sheet}>
+          <Text style={setS.sheetTitle}>{title}</Text>
+          {options.map(opt => (
+            <TouchableOpacity key={opt.key} style={setS.option}
+              onPress={() => { onSelect(opt.key); onClose(); }}>
+              <Text style={[setS.optionText, opt.key === current && setS.optionTextActive]}>{opt.label}</Text>
+              {opt.key === current && <MaterialCommunityIcons name="check" size={18} color={c.accent}/>}
+            </TouchableOpacity>
+          ))}
+        </View>
+      </TouchableOpacity>
+    </Modal>
+  );
+};
+
 const LibraryPage = ({tracks, onTrackPress, navIntent, onNavConsumed}: {
   tracks: Track[]; onTrackPress: (t: Track, queue?: Track[]) => void;
   navIntent?: {type: 'album' | 'artist'; value: string} | null; onNavConsumed?: () => void;
@@ -1370,11 +1713,31 @@ const LibraryPage = ({tracks, onTrackPress, navIntent, onNavConsumed}: {
   const [view, setView] = useState<ViewMode>('list');
   // Catégorie ouverte (drill-in) : la liste des morceaux qu'elle contient.
   const [drill, setDrill] = useState<{label: string; items: Track[]} | null>(null);
+  // Texte de recherche (filtre titre / artiste / album, prioritaire sur l'onglet).
+  const [query, setQuery] = useState('');
+  // Offset de scroll mémorisé par liste (clé = catégorie) : restauré au retour
+  // d'un drill pour ne pas repartir en haut de la liste.
+  const scrollOffsets = useRef<Record<string, number>>({});
+  // Tri courant : pistes (Titres / drill) et catégories, + quelle sheet est ouverte.
+  const [trackSort, setTrackSort] = useState<string | null>(null);
+  const [catSort,   setCatSort]   = useState<string | null>(null);
+  const [sortSheet, setSortSheet] = useState<'tracks' | 'cats' | null>(null);
   const {S} = useStyles();
   const c = useColors();
 
+  // Retour Android : ferme la sheet de tri, efface la recherche, referme le drill.
+  useBackHandler(BACK.MODAL,  () => { if (sortSheet) { setSortSheet(null); return true; } return false; });
+  useBackHandler(BACK.SEARCH, () => { if (query) { setQuery(''); return true; } return false; });
+  useBackHandler(BACK.DRILL,  () => { if (drill)  { setDrill(null); return true; } return false; });
+
+  const sortTracks = (list: Track[]) => applySort(list, TRACK_SORTS, trackSort);
+  const sortCats   = (list: CatItem[]) => applySort(list, CAT_SORTS, catSort);
+
   const selectTab = (i: number) => { setActiveTab(i); setDrill(null); };
-  const openCategory = (item: CatItem) => setDrill({label: item.name, items: tracks.filter(item.filter)});
+  const openCategory = (item: CatItem) => {
+    const items = tracks.filter(item.filter);
+    setDrill({label: item.name, items: item.id.startsWith('album:') ? sortAlbumTracks(items) : items});
+  };
 
   // Comptages par catégorie en UNE passe (au lieu de O(catégories × titres) à chaque rendu).
   const counts = useMemo(() => {
@@ -1391,25 +1754,54 @@ const LibraryPage = ({tracks, onTrackPress, navIntent, onNavConsumed}: {
     return {artist, genre, year, format};
   }, [tracks]);
 
+  // Pochette représentative par catégorie = 1re piste (avec cover) de chaque clé.
+  // Calculé en UNE passe pour éviter des tracks.find() par catégorie. Sert aux
+  // catégories sans image propre (genres, dossiers, qualité, artistes, années…).
+  const covers = useMemo(() => {
+    const artist = new Map<string, string>();
+    const genre  = new Map<string, string>();
+    const year   = new Map<string, string>();
+    const format = new Map<string, string>();
+    const folder = new Map<string, string>();
+    const quality= new Map<string, string>();
+    const put = (m: Map<string, string>, k: string | undefined, uri: string) => { if (k && !m.has(k)) m.set(k, uri); };
+    for (const t of tracks) {
+      if (!t.artUri) continue;
+      put(artist, t.artist, t.artUri);
+      put(genre,  t.genre,  t.artUri);
+      put(year,   t.year,   t.artUri);
+      put(format, t.format, t.artUri);
+      put(folder, t.filePath?.split('/').slice(0, -1).join('/'), t.artUri);
+      put(quality, qualityGroup(t).key, t.artUri);
+    }
+    return {artist, genre, year, format, folder, quality};
+  }, [tracks]);
+
   // Navigation venue du menu 3-points : ouvre l'album / l'artiste demandé.
   useEffect(() => {
     if (!navIntent) return;
     const isAlbum = navIntent.type === 'album';
     setActiveTab(isAlbum ? 2 : 1);
+    const items = tracks.filter(t => (isAlbum ? t.album : t.artist) === navIntent.value);
     setDrill({
       label: navIntent.value,
-      items: tracks.filter(t => (isAlbum ? t.album : t.artist) === navIntent.value),
+      items: isAlbum ? sortAlbumTracks(items) : items,
     });
     onNavConsumed?.();
   }, [navIntent, tracks, onNavConsumed]);
 
   // Rendu générique d'une catégorie (liste ou grille), entièrement cliquable.
-  const renderCategory = (items: CatItem[], label: string, icon: string) => (
+  const renderCategory = (rawItems: CatItem[], label: string, icon: string) => {
+    const items = sortCats(rawItems);
+    return (
     <>
-      <Toolbar count={items.length} label={label} view={view} onView={setView}/>
+      <Toolbar count={items.length} label={label} view={view} onView={setView}
+        onSort={() => setSortSheet('cats')} sortActive={!!catSort}/>
       {view === 'grid'
         ? <CategoryGrid items={items} icon={icon} onOpen={it => openCategory(it as CatItem)}/>
         : <IndexedList data={items} getName={(it: CatItem) => it.name} keyExtractor={(i: CatItem) => i.id}
+            initialOffset={scrollOffsets.current[label] ?? 0}
+            onOffset={y => { scrollOffsets.current[label] = y; }}
             renderItem={({item}) => (
               <TrackRow
                 track={{title:item.name, artist:item.sub, artUri:item.artUri, format:'', genre:'', year:''}}
@@ -1417,11 +1809,37 @@ const LibraryPage = ({tracks, onTrackPress, navIntent, onNavConsumed}: {
             )}/>
       }
     </>
-  );
+    );
+  };
 
   const renderContent = () => {
+    // Recherche active : résultats globaux (titre / artiste / album), prioritaire
+    // sur l'onglet et le drill. File de lecture = les résultats affichés.
+    const q = query.trim().toLowerCase();
+    if (q) {
+      const results = sortTracks(tracks.filter(t =>
+        t.title?.toLowerCase().includes(q) ||
+        t.artist?.toLowerCase().includes(q) ||
+        t.album?.toLowerCase().includes(q)));
+      if (results.length === 0) {
+        return <EmptyState msg="Aucun résultat" sub={`Rien ne correspond à « ${query.trim()} »`}/>;
+      }
+      return (
+        <>
+          <Toolbar count={results.length} label="résultats" view={view} onView={setView}
+            onSort={() => setSortSheet('tracks')} sortActive={!!trackSort}
+            onPlayAll={() => onTrackPress(results[0], results)}/>
+          {view === 'grid'
+            ? <TrackGrid tracks={results} onPress={t => onTrackPress(t, results)}/>
+            : <FlatList data={results} keyExtractor={i=>i.id} initialNumToRender={20}
+                renderItem={({item}) => <TrackRow track={item} onPress={() => onTrackPress(item, results)}/>}/>
+          }
+        </>
+      );
+    }
     // Vue détail d'une catégorie : ses morceaux, jouables (file = la catégorie).
     if (drill) {
+      const items = sortTracks(drill.items);
       return (
         <View style={S.content}>
           <View style={S.plDetailHeader}>
@@ -1430,37 +1848,44 @@ const LibraryPage = ({tracks, onTrackPress, navIntent, onNavConsumed}: {
             </TouchableOpacity>
             <Text style={S.plDetailTitle} numberOfLines={1}>{drill.label}</Text>
           </View>
-          <Toolbar count={drill.items.length} label="pistes" view={view} onView={setView}
-            onPlayAll={() => drill.items.length && onTrackPress(drill.items[0], drill.items)}/>
+          <Toolbar count={items.length} label="pistes" view={view} onView={setView}
+            onSort={() => setSortSheet('tracks')} sortActive={!!trackSort}
+            onPlayAll={() => items.length && onTrackPress(items[0], items)}/>
           {view === 'grid'
-            ? <TrackGrid tracks={drill.items} onPress={t => onTrackPress(t, drill.items)}/>
-            : <FlatList data={drill.items} keyExtractor={i=>i.id} initialNumToRender={20}
-                renderItem={({item}) => <TrackRow track={item} onPress={() => onTrackPress(item, drill.items)}/>}/>
+            ? <TrackGrid tracks={items} onPress={t => onTrackPress(t, items)}/>
+            : <FlatList data={items} keyExtractor={i=>i.id} initialNumToRender={20}
+                renderItem={({item}) => <TrackRow track={item} onPress={() => onTrackPress(item, items)}/>}/>
           }
         </View>
       );
     }
 
     // Titres
-    if (activeTab === 0) return (
+    if (activeTab === 0) {
+      const list = sortTracks(tracks);
+      return (
       <>
-        <Toolbar count={tracks.length} label="pistes" view={view} onView={setView}
-          onPlayAll={() => tracks.length && onTrackPress(tracks[0], tracks)}/>
+        <Toolbar count={list.length} label="pistes" view={view} onView={setView}
+          onSort={() => setSortSheet('tracks')} sortActive={!!trackSort}
+          onPlayAll={() => list.length && onTrackPress(list[0], list)}/>
         {view === 'grid'
-          ? <TrackGrid tracks={tracks} onPress={t => onTrackPress(t, tracks)}/>
+          ? <TrackGrid tracks={list} onPress={t => onTrackPress(t, list)}/>
           : <IndexedList
-              data={tracks}
+              data={list}
               getName={t => t.title}
               keyExtractor={i => i.id}
-              renderItem={({item}) => <TrackRow track={item} onPress={() => onTrackPress(item, tracks)}/>}
+              initialOffset={scrollOffsets.current['titres'] ?? 0}
+              onOffset={y => { scrollOffsets.current['titres'] = y; }}
+              renderItem={({item}) => <TrackRow track={item} onPress={() => onTrackPress(item, list)}/>}
             />
         }
       </>
-    );
+      );
+    }
     // Artistes
     if (activeTab === 1) {
       const items: CatItem[] = [...counts.artist.keys()].sort()
-        .map(a => ({name:a, id:'artist:'+a, sub:counts.artist.get(a)+' pistes', filter:(t:Track)=>t.artist===a}));
+        .map(a => ({name:a, id:'artist:'+a, sub:counts.artist.get(a)+' pistes', artUri:covers.artist.get(a), filter:(t:Track)=>t.artist===a}));
       return renderCategory(items, 'artistes', 'account');
     }
     // Albums
@@ -1475,19 +1900,19 @@ const LibraryPage = ({tracks, onTrackPress, navIntent, onNavConsumed}: {
     // Genres
     if (activeTab === 3) {
       const items: CatItem[] = [...counts.genre.keys()].sort()
-        .map(g => ({name:g, id:'genre:'+g, sub:counts.genre.get(g)+' pistes', filter:(t:Track)=>t.genre===g}));
+        .map(g => ({name:g, id:'genre:'+g, sub:counts.genre.get(g)+' pistes', artUri:covers.genre.get(g), filter:(t:Track)=>t.genre===g}));
       return renderCategory(items, 'genres', 'music-circle-outline');
     }
     // Dossiers
     if (activeTab === 4) {
       const folders = [...new Set(tracks.map(t => t.filePath?.split('/').slice(0,-1).join('/') ?? '').filter(Boolean))];
-      const items: CatItem[] = folders.map(f => ({name: f.split('/').pop() ?? f, id:'folder:'+f, sub: tracks.filter(t=>t.filePath?.startsWith(f)).length + ' pistes', filter:(t:Track)=>!!t.filePath?.startsWith(f)}));
+      const items: CatItem[] = folders.map(f => ({name: f.split('/').pop() ?? f, id:'folder:'+f, sub: tracks.filter(t=>t.filePath?.startsWith(f)).length + ' pistes', artUri:covers.folder.get(f), filter:(t:Track)=>!!t.filePath?.startsWith(f)}));
       return renderCategory(items, 'dossiers', 'folder-outline');
     }
     // Années
     if (activeTab === 5) {
       const items: CatItem[] = [...counts.year.keys()].sort((a,b)=>Number(b)-Number(a))
-        .map(y => ({name:y, id:'year:'+y, sub:counts.year.get(y)+' pistes', filter:(t:Track)=>t.year===y}));
+        .map(y => ({name:y, id:'year:'+y, sub:counts.year.get(y)+' pistes', artUri:covers.year.get(y), filter:(t:Track)=>t.year===y}));
       return renderCategory(items, 'annees', 'calendar-outline');
     }
     // Sampling — regroupement par qualité audio (taux d'échantillonnage / DSD)
@@ -1501,27 +1926,49 @@ const LibraryPage = ({tracks, onTrackPress, navIntent, onNavConsumed}: {
       });
       const items: CatItem[] = [...groups.entries()]
         .sort((a, b) => a[1].rate - b[1].rate)
-        .map(([key, g]) => ({name: g.label, id:'q:'+key, sub: g.count + ' pistes', filter:(t:Track)=>qualityGroup(t).key===key}));
+        .map(([key, g]) => ({name: g.label, id:'q:'+key, sub: g.count + ' pistes', artUri:covers.quality.get(key), filter:(t:Track)=>qualityGroup(t).key===key}));
       if (items.length === 0) return <EmptyState msg="Qualité audio" sub="Aucune info de taux d'échantillonnage"/>;
       return renderCategory(items, 'qualites', 'sine-wave');
     }
     // Format
     if (activeTab === 7) {
       const items: CatItem[] = [...counts.format.keys()].sort()
-        .map(f => ({name:f, id:'fmt:'+f, sub:counts.format.get(f)+' pistes', filter:(t:Track)=>t.format===f}));
+        .map(f => ({name:f, id:'fmt:'+f, sub:counts.format.get(f)+' pistes', artUri:covers.format.get(f), filter:(t:Track)=>t.format===f}));
       return renderCategory(items, 'formats', 'file-music-outline');
     }
     return null;
   };
+
+  // Le bouton de tri de l'en-tête cible les pistes (Titres / drill / recherche)
+  // ou les catégories selon la vue courante.
+  const isTrackView = !!query.trim() || !!drill || activeTab === 0;
+  const headerSortActive = isTrackView ? !!trackSort : !!catSort;
 
   return (
     <View style={S.page}>
       <View style={S.header}>
         <Text style={S.headerTitle}>{LIB_TABS[activeTab].label}</Text>
         <View style={S.headerRight}>
-          <TouchableOpacity style={S.headerBtn}><MaterialCommunityIcons name="sort-ascending" size={20} color={c.textDim}/></TouchableOpacity>
-          <TouchableOpacity style={S.headerBtn}><MaterialCommunityIcons name="magnify"        size={20} color={c.textDim}/></TouchableOpacity>
+          <TouchableOpacity style={S.headerBtn} onPress={() => setSortSheet(isTrackView ? 'tracks' : 'cats')}>
+            <MaterialCommunityIcons name="sort-ascending" size={20} color={headerSortActive ? c.accent : c.textDim}/>
+          </TouchableOpacity>
         </View>
+      </View>
+      <View style={S.searchBar}>
+        <MaterialCommunityIcons name="magnify" size={18} color={c.iconDim}/>
+        <TextInput
+          style={S.searchInput}
+          placeholder="Rechercher un titre, artiste, album…"
+          placeholderTextColor={c.textDim}
+          value={query}
+          onChangeText={setQuery}
+          returnKeyType="search"
+          clearButtonMode="never"/>
+        {query.length > 0 && (
+          <TouchableOpacity onPress={() => setQuery('')} hitSlop={{top:8,bottom:8,left:8,right:8}}>
+            <MaterialCommunityIcons name="close-circle" size={18} color={c.iconDim}/>
+          </TouchableOpacity>
+        )}
       </View>
       <ScrollView horizontal showsHorizontalScrollIndicator={false} style={S.tabsScroll}>
         <View style={S.tabs}>
@@ -1534,6 +1981,15 @@ const LibraryPage = ({tracks, onTrackPress, navIntent, onNavConsumed}: {
         </View>
       </ScrollView>
       <View style={S.content}>{renderContent()}</View>
+
+      <SortSheet
+        visible={sortSheet === 'tracks'} title="Trier les titres"
+        options={TRACK_SORTS} current={trackSort}
+        onSelect={setTrackSort} onClose={() => setSortSheet(null)}/>
+      <SortSheet
+        visible={sortSheet === 'cats'} title="Trier"
+        options={CAT_SORTS} current={catSort}
+        onSelect={setCatSort} onClose={() => setSortSheet(null)}/>
     </View>
   );
 };
@@ -1647,7 +2103,7 @@ const AddToPlaylistSheet = ({trackId, visible, onClose}: {trackId: string | null
 };
 
 // Onglet Playlists : liste des playlists + vue détail d'une playlist.
-const PlaylistsTab = ({tracks, onTrackPress}: {tracks: Track[]; onTrackPress: (t: Track) => void}) => {
+const PlaylistsTab = ({tracks, onTrackPress}: {tracks: Track[]; onTrackPress: (t: Track, queue?: Track[]) => void}) => {
   const {S} = useStyles();
   const c = useColors();
   const playlists = usePlaylists();
@@ -1655,6 +2111,10 @@ const PlaylistsTab = ({tracks, onTrackPress}: {tracks: Track[]; onTrackPress: (t
   const [naming, setNaming] = useState<{mode: 'create'} | {mode: 'rename'; id: string; current: string} | null>(null);
 
   const opened = playlists.find(p => p.id === openId) ?? null;
+
+  // Retour Android : ferme la modale de nommage, sinon la playlist ouverte.
+  useBackHandler(BACK.MODAL, () => { if (naming) { setNaming(null); return true; } return false; });
+  useBackHandler(BACK.DRILL, () => { if (openId) { setOpenId(null); return true; } return false; });
 
   const confirmDelete = (pl: Playlist) =>
     Alert.alert('Supprimer la playlist', `Supprimer « ${pl.name} » ?`, [
@@ -1683,9 +2143,12 @@ const PlaylistsTab = ({tracks, onTrackPress}: {tracks: Track[]; onTrackPress: (t
           : <FlatList
               data={items}
               keyExtractor={i => i.id}
-              renderItem={({item}) => (
-                <TrackRow track={item} onPress={() => onTrackPress(item)}
-                  onDots={() => removeTrack(opened.id, item.id)} dotsIcon="minus-circle-outline"/>
+              renderItem={({item, index}) => (
+                <TrackRow track={item} onPress={() => onTrackPress(item, items)}
+                  onDots={() => removeTrack(opened.id, item.id)} dotsIcon="minus-circle-outline"
+                  onMoveUp={() => moveTrack(opened.id, opened.trackIds.indexOf(item.id), opened.trackIds.indexOf(items[index - 1].id))}
+                  onMoveDown={() => moveTrack(opened.id, opened.trackIds.indexOf(item.id), opened.trackIds.indexOf(items[index + 1].id))}
+                  canMoveUp={index > 0} canMoveDown={index < items.length - 1}/>
               )}/>
         }
         <NameModal
@@ -1733,32 +2196,61 @@ const PlaylistsTab = ({tracks, onTrackPress}: {tracks: Track[]; onTrackPress: (t
 };
 
 // ─── Favorites Page ───────────────────────────────────────────────────────────
-const FavoritesPage = ({tracks, onTrackPress}: {tracks: Track[]; onTrackPress: (t: Track) => void}) => {
+const FavoritesPage = ({tracks, onTrackPress}: {tracks: Track[]; onTrackPress: (t: Track, queue?: Track[]) => void}) => {
   const [activeTab, setActiveTab] = useState(0);
   const [view, setView] = useState<ViewMode>('list');
   const {S} = useStyles();
   const c = useColors();
   const favorites = useFavorites();
+  const playCounts = usePlayCounts();
+  const [trackSort, setTrackSort] = useState<string | null>(null);
+  const [sortOpen, setSortOpen] = useState(false);
+  const sortTracks = (l: Track[]) => applySort(l, TRACK_SORTS, trackSort);
+  useBackHandler(BACK.MODAL, () => { if (sortOpen) { setSortOpen(false); return true; } return false; });
 
   const renderContent = () => {
     if (activeTab === 1) return <PlaylistsTab tracks={tracks} onTrackPress={onTrackPress}/>;
 
+    // Onglet « + Joués » : pistes déjà lues, triées par nombre de lectures décroissant.
+    if (activeTab === 3) {
+      const played = sortTracks(tracks
+        .filter(t => (playCounts[t.id] ?? 0) > 0)
+        .sort((a, b) => (playCounts[b.id] ?? 0) - (playCounts[a.id] ?? 0)));
+      if (played.length === 0) {
+        return <EmptyState msg="Aucune écoute" sub="Les titres que tu écoutes apparaîtront ici, classés par nombre de lectures"/>;
+      }
+      return (
+        <>
+          <Toolbar count={played.length} label="pistes" view={view} onView={setView}
+            onSort={() => setSortOpen(true)} sortActive={!!trackSort}/>
+          {view === 'grid'
+            ? <TrackGrid tracks={played} onPress={t => onTrackPress(t, played)}/>
+            : <FlatList data={played} keyExtractor={i=>i.id}
+                renderItem={({item}) => (
+                  <TrackRow track={item} count={playCounts[item.id] ?? 0} onPress={() => onTrackPress(item, played)}/>
+                )}/>
+          }
+        </>
+      );
+    }
+
     // Onglet Favoris : on filtre la bibliothèque sur les ids favoris (ordre de favori).
     if (activeTab === 0) {
-      const favTracks = favorites
+      const favTracks = sortTracks(favorites
         .map(id => tracks.find(t => t.id === id))
-        .filter(Boolean) as Track[];
+        .filter(Boolean) as Track[]);
       if (favTracks.length === 0) {
         return <EmptyState msg="Aucun favori" sub="Touche le ♥ dans le lecteur pour ajouter un morceau"/>;
       }
       return (
         <>
-          <Toolbar count={favTracks.length} label="pistes" view={view} onView={setView}/>
+          <Toolbar count={favTracks.length} label="pistes" view={view} onView={setView}
+            onSort={() => setSortOpen(true)} sortActive={!!trackSort}/>
           {view === 'grid'
-            ? <TrackGrid tracks={favTracks} onPress={onTrackPress}/>
+            ? <TrackGrid tracks={favTracks} onPress={t => onTrackPress(t, favTracks)}/>
             : <FlatList data={favTracks} keyExtractor={i=>i.id}
                 renderItem={({item}) => (
-                  <TrackRow track={item} onPress={() => onTrackPress(item)}
+                  <TrackRow track={item} onPress={() => onTrackPress(item, favTracks)}
                     onDots={() => toggleFavorite(item.id)} dotsIcon="heart" dotsColor="#ff4d6d"/>
                 )}/>
           }
@@ -1766,13 +2258,17 @@ const FavoritesPage = ({tracks, onTrackPress}: {tracks: Track[]; onTrackPress: (
       );
     }
 
-    const list = activeTab === 4 ? [...tracks].reverse() : tracks;
+    // « Ajoutés » (idx 4) : par date d'ajout décroissante (plus récents en 1er).
+    const list = sortTracks(activeTab === 4
+      ? [...tracks].sort((a, b) => (b.dateAdded ?? 0) - (a.dateAdded ?? 0))
+      : tracks);
     return (
       <>
-        <Toolbar count={list.length} label="pistes" view={view} onView={setView}/>
+        <Toolbar count={list.length} label="pistes" view={view} onView={setView}
+          onSort={() => setSortOpen(true)} sortActive={!!trackSort}/>
         {view === 'grid'
-          ? <TrackGrid tracks={list} onPress={onTrackPress}/>
-          : <FlatList data={list} keyExtractor={i=>i.id} renderItem={({item}) => <TrackRow track={item} onPress={() => onTrackPress(item)}/>}/>
+          ? <TrackGrid tracks={list} onPress={t => onTrackPress(t, list)}/>
+          : <FlatList data={list} keyExtractor={i=>i.id} renderItem={({item}) => <TrackRow track={item} onPress={() => onTrackPress(item, list)}/>}/>
         }
       </>
     );
@@ -1783,8 +2279,11 @@ const FavoritesPage = ({tracks, onTrackPress}: {tracks: Track[]; onTrackPress: (
       <View style={S.header}>
         <Text style={S.headerTitle}>{FAV_TABS[activeTab].label}</Text>
         <View style={S.headerRight}>
-          <TouchableOpacity style={S.headerBtn}><MaterialCommunityIcons name="sort-ascending" size={20} color={c.textDim}/></TouchableOpacity>
-          <TouchableOpacity style={S.headerBtn}><MaterialCommunityIcons name="dots-vertical"  size={20} color={c.textDim}/></TouchableOpacity>
+          {activeTab !== 1 && (
+            <TouchableOpacity style={S.headerBtn} onPress={() => setSortOpen(true)}>
+              <MaterialCommunityIcons name="sort-ascending" size={20} color={trackSort ? c.accent : c.textDim}/>
+            </TouchableOpacity>
+          )}
         </View>
       </View>
       <ScrollView horizontal showsHorizontalScrollIndicator={false} style={S.tabsScroll}>
@@ -1802,29 +2301,43 @@ const FavoritesPage = ({tracks, onTrackPress}: {tracks: Track[]; onTrackPress: (
         </View>
       </ScrollView>
       <View style={S.content}>{renderContent()}</View>
+
+      <SortSheet
+        visible={sortOpen} title="Trier les titres"
+        options={TRACK_SORTS} current={trackSort}
+        onSelect={setTrackSort} onClose={() => setSortOpen(false)}/>
     </View>
   );
 };
 
 // ─── Settings Page ────────────────────────────────────────────────────────────
-const THEME_OPTS   = ['Sombre', 'Clair', 'Automatique'];
+const THEME_OPTS   = ['Sombre', 'Clair', 'Flou', 'Automatique'];
 const EQ_OPTS      = ['Aucun', 'Rock', 'Pop', 'Jazz', 'Électronique', 'Classique', 'Personnalisé'];
 const QUALITY_OPTS = ['Haute fidélité', 'Standard', 'Économie de données'];
+const CROSSFADE_OPTS = ['Désactivé', '2 s', '3 s', '4 s', '6 s', '8 s'];
+const crossfadeToSec = (v: string) => (v === 'Désactivé' ? 0 : parseInt(v, 10) || 0);
+const REPLAYGAIN_OPTS = ['Désactivé', 'Par piste', 'Par album'];
+const replayGainToMode = (v: string): RgMode => (v === 'Par piste' ? 'track' : v === 'Par album' ? 'album' : 'off');
 
 type SettingsProps = {
   theme: string;        setTheme: (v: string) => void;
   eq: string;           setEq: (v: string) => void;
   quality: string;      setQuality: (v: string) => void;
+  crossfade: string;    setCrossfade: (v: string) => void;
+  replayGain: string;   setReplayGain: (v: string) => void;
   onScan: () => void;   scanState: 'idle'|'scanning'|'done'|'denied';
   onOpenTags: () => void;
 };
 
 type PickerState = {title: string; options: string[]; current: string; onSelect: (v: string) => void} | null;
 
-const SettingsPage = ({theme, setTheme, eq, setEq, quality, setQuality, onScan, scanState, onOpenTags}: SettingsProps) => {
+const SettingsPage = ({theme, setTheme, eq, setEq, quality, setQuality, crossfade, setCrossfade, replayGain, setReplayGain, onScan, scanState, onOpenTags}: SettingsProps) => {
   const [picker, setPicker] = useState<PickerState>(null);
   const {S, setS} = useStyles();
   const c = useColors();
+
+  // Retour Android : ferme la modale de sélection (thème / EQ / qualité).
+  useBackHandler(BACK.MODAL, () => { if (picker) { setPicker(null); return true; } return false; });
 
   const open = (title: string, options: string[], current: string, onSelect: (v: string) => void) =>
     setPicker({title, options, current, onSelect});
@@ -1834,6 +2347,8 @@ const SettingsPage = ({theme, setTheme, eq, setEq, quality, setQuality, onScan, 
     {label:'Égaliseur par défaut',   value: eq,      onPress: () => open('Égaliseur par défaut', EQ_OPTS, eq, setEq)},
     {label:'Égaliseurs par tag',     value:'›',      onPress: onOpenTags},
     {label:'Qualité audio',          value: quality, onPress: () => open('Qualité audio', QUALITY_OPTS, quality, setQuality)},
+    {label:'Fondu enchaîné',         value: crossfade, onPress: () => open('Fondu enchaîné', CROSSFADE_OPTS, crossfade, setCrossfade)},
+    {label:'Normalisation du volume', value: replayGain, onPress: () => open('Normalisation du volume', REPLAYGAIN_OPTS, replayGain, setReplayGain)},
     {label:'Scanner la bibliothèque', value: scanState === 'scanning' ? '…' : '↻', onPress: onScan},
     {label:'Dossiers surveillés',    value:'›', onPress: () => Alert.alert('Dossiers surveillés', 'Fonctionnalité à venir.')},
     {label:'À propos',               value:'›', onPress: () => Alert.alert('EQPlayer', 'Version 0.1.0\nLecteur de musique audiophile.\nDéveloppé avec amour.')},
@@ -2096,10 +2611,17 @@ const tmS = StyleSheet.create({
 // ─── App Root ─────────────────────────────────────────────────────────────────
 async function requestMusicPermission(): Promise<boolean> {
   if (Platform.OS !== 'android') return false;
-  const perm = parseInt(String(Platform.Version), 10) >= 33
-    ? PermissionsAndroid.PERMISSIONS.READ_MEDIA_AUDIO
-    : PermissionsAndroid.PERMISSIONS.READ_EXTERNAL_STORAGE;
-  const result = await PermissionsAndroid.request(perm, {
+  const api = parseInt(String(Platform.Version), 10);
+  if (api >= 33) {
+    // Audio (requis pour la biblio) + Images (facultatif, pour les pochettes de
+    // dossier cover.jpg lues via MediaStore.Images).
+    const res = await PermissionsAndroid.requestMultiple([
+      PermissionsAndroid.PERMISSIONS.READ_MEDIA_AUDIO,
+      PermissionsAndroid.PERMISSIONS.READ_MEDIA_IMAGES,
+    ]);
+    return res[PermissionsAndroid.PERMISSIONS.READ_MEDIA_AUDIO] === PermissionsAndroid.RESULTS.GRANTED;
+  }
+  const result = await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.READ_EXTERNAL_STORAGE, {
     title: 'Accès à la musique',
     message: 'EQPlayer a besoin d\'accéder à vos fichiers audio pour afficher votre bibliothèque.',
     buttonPositive: 'Autoriser',
@@ -2112,6 +2634,7 @@ export default function App() {
   const [page,         setPage]         = useState(0);
   const [currentTrack, setCurrentTrack] = useState<Track|null>(null);
   const [playerOpen,   setPlayerOpen]   = useState(false);
+  const [lyricsOpen,   setLyricsOpen]   = useState(false);
   const [eqOpen,       setEqOpen]       = useState(false);
   const [srOpen,       setSrOpen]       = useState(false);
   // Égaliseurs par tag
@@ -2136,6 +2659,8 @@ export default function App() {
   const [theme,   setTheme]   = useState('Sombre');
   const [eq,      setEq]      = useState('Aucun');
   const [quality, setQuality] = useState('Haute fidélité');
+  const [crossfade, setCrossfade] = useState('Désactivé');
+  const [replayGain, setReplayGain] = useState('Désactivé');
   // Égaliseur paramétrique (DynamicsProcessing) : fréquences + gains éditables
   const [peqRange, setPeqRange] = useState<{minDb: number; maxDb: number} | null>(null);
   const [eqBands,  setEqBands]  = useState<PeqBand[]>([]);
@@ -2155,6 +2680,14 @@ export default function App() {
   const setThemePref   = useCallback(persist('pref.theme', setTheme),     [persist]);
   const setEqPref      = useCallback(persist('pref.eq', setEq),           [persist]);
   const setQualityPref = useCallback(persist('pref.quality', setQuality), [persist]);
+  const setCrossfadePref = useCallback(
+    persist('pref.crossfade', (v: string) => { setCrossfade(v); setCrossfadeSec(crossfadeToSec(v)); }),
+    [persist],
+  );
+  const setReplayGainPref = useCallback(
+    persist('pref.replayGain', (v: string) => { setReplayGain(v); setReplayGainMode(replayGainToMode(v)); }),
+    [persist],
+  );
 
   // Init TrackPlayer une seule fois au démarrage
   useEffect(() => { setupPlayer().catch(console.warn); }, []);
@@ -2164,11 +2697,19 @@ export default function App() {
     (async () => {
       const stored = await AsyncStorage.getMany([
         'pref.theme', 'pref.eq', 'pref.quality', 'pref.peqBands',
-        'pref.srSpeed', 'pref.srReverb',
+        'pref.srSpeed', 'pref.srReverb', 'pref.crossfade', 'pref.replayGain',
       ]);
       if (stored['pref.theme'])   setTheme(stored['pref.theme']!);
       if (stored['pref.eq'])      setEq(stored['pref.eq']!);
       if (stored['pref.quality']) setQuality(stored['pref.quality']!);
+      if (stored['pref.crossfade']) {
+        setCrossfade(stored['pref.crossfade']!);
+        setCrossfadeSec(crossfadeToSec(stored['pref.crossfade']!));
+      }
+      if (stored['pref.replayGain']) {
+        setReplayGain(stored['pref.replayGain']!);
+        setReplayGainMode(replayGainToMode(stored['pref.replayGain']!));
+      }
 
       // Slowed + Reverb : restaure et applique vitesse/pitch + réverbération.
       const savedSpeed = stored['pref.srSpeed'] ? parseFloat(stored['pref.srSpeed']!) : 1.0;
@@ -2391,43 +2932,46 @@ export default function App() {
     );
   }, [eqTagList, editingTagId, closeTagEq]);
 
-  const scan = useCallback(async () => {
-    setScanState('scanning');
+  // `silent` : rafraîchissement en arrière-plan (pas de bandeau « scan ») quand on
+  // affiche déjà le cache — sert à récupérer les fichiers ajoutés depuis.
+  const scan = useCallback(async (silent = false) => {
+    if (!silent) setScanState('scanning');
     const granted = await requestMusicPermission();
-    if (!granted) { setScanState('denied'); return; }
+    if (!granted) { if (!silent) setScanState('denied'); return; }
     try {
       const result: Track[] = await MusicLibrary.getTracks();
       setTracks(result);
       setScanCount(result.length);
       setScanState('done');
       // Cache la bibliothèque pour un démarrage instantané au prochain lancement.
-      AsyncStorage.setItem('cache.tracks.v2', JSON.stringify(result)).catch(() => {});
+      AsyncStorage.setItem('cache.tracks.v4', JSON.stringify(result)).catch(() => {});
     } catch (e) {
       console.warn('Scan error:', e);
       setScanState('done');
     }
   }, []);
 
-  // Au démarrage : on charge la dernière bibliothèque connue (instantané, sans
-  // flash des démos) et on ne (re)scanne QUE si aucun cache. Le re-scan reste
-  // accessible à la demande via les Paramètres (bouton « Scanner »).
+  // Au démarrage : on affiche instantanément la dernière bibliothèque connue
+  // (cache), PUIS on relance toujours un scan pour récupérer les fichiers ajoutés
+  // depuis (silencieux si le cache était présent → pas de bandeau clignotant).
   useEffect(() => {
     (async () => {
+      let hadCache = false;
       try {
-        const cached = await AsyncStorage.getItem('cache.tracks.v2');
+        const cached = await AsyncStorage.getItem('cache.tracks.v4');
         if (cached) {
           const list = JSON.parse(cached) as Track[];
           if (list.length) {
             setTracks(list);
             setScanCount(list.length);
             setScanState('done');
-            return;
+            hadCache = true;
           }
         }
       } catch {
-        // cache illisible → on retombe sur un scan
+        // cache illisible → scan visible
       }
-      scan();
+      scan(hadCache);
     })();
   }, [scan]);
 
@@ -2436,6 +2980,25 @@ export default function App() {
     {label:'Mes listes',   icon:'format-list-bulleted'},
     {label:'Paramètres',   icon:'account-circle-outline'},
   ];
+
+  // ─── Retour Android au niveau racine (overlays, modales, onglets) ───
+  // Referme le dessus de la pile plutôt que de quitter l'app.
+  useBackHandler(BACK.MODAL, () => {
+    if (addPlTrackId) { setAddPlTrackId(null); return true; }
+    if (sleepOpen)    { setSleepOpen(false);  return true; }
+    if (infoTrack)    { setInfoTrack(null);   return true; }
+    if (tagNaming)    { setTagNaming(null);   return true; }
+    if (tagPickTrack) { setTagPickTrack(null); return true; }
+    if (menuTrack)    { closeTrackMenu();     return true; }
+    return false;
+  });
+  useBackHandler(BACK.TAG_EQ,  () => { if (editingTag && tagEqApi) { closeTagEq(); return true; } return false; });
+  useBackHandler(BACK.EQ,      () => { if (eqOpen) { closeBaseEq(); return true; } return false; });
+  useBackHandler(BACK.EQ,      () => { if (srOpen) { setSrOpen(false); return true; } return false; });
+  useBackHandler(BACK.TAG_MGR, () => { if (tagMgrOpen) { setTagMgrOpen(false); return true; } return false; });
+  useBackHandler(BACK.LYRICS,  () => { if (lyricsOpen) { setLyricsOpen(false); return true; } return false; });
+  useBackHandler(BACK.PLAYER,  () => { if (playerOpen) { setPlayerOpen(false); return true; } return false; });
+  useBackHandler(BACK.TAB,     () => { if (page !== 0) { setPage(0); return true; } return false; });
 
   // Minuterie de veille : (re)programme une pause après N minutes (0 = off).
   const applySleep = useCallback((min: number) => {
@@ -2481,7 +3044,7 @@ export default function App() {
           if (ok) {
             setTracks(prev => {
               const next = prev.filter(x => x.id !== t.id);
-              AsyncStorage.setItem('cache.tracks.v2', JSON.stringify(next)).catch(() => {});
+              AsyncStorage.setItem('cache.tracks.v4', JSON.stringify(next)).catch(() => {});
               return next;
             });
           }
@@ -2495,8 +3058,10 @@ export default function App() {
   // Palette active selon la préférence de thème
   const scheme = useColorScheme();
   const colors = theme === 'Clair'        ? LIGHT
+               : theme === 'Flou'         ? FLOU
                : theme === 'Automatique'  ? (scheme === 'light' ? LIGHT : DARK)
                : DARK;
+  const blurBg = theme === 'Flou';
   const {S} = stylesFor(colors);
 
   const openTrack = useCallback(async (t: Track, queue?: Track[]) => {
@@ -2506,10 +3071,58 @@ export default function App() {
     await playTrack(t, queue ?? tracks);
   }, [tracks]);
 
+  // Ouverture d'un fichier audio depuis l'explorateur (intent VIEW) : on résout
+  // l'URI (id MediaStore + chemin) puis on retient la cible.
+  const [openTarget, setOpenTarget] = useState<{id: string | null; path: string | null} | null>(null);
+  useEffect(() => {
+    const handle = async (uri: string | null) => {
+      if (!uri) return;
+      try {
+        const res = await MusicLibrary.resolveAudio(uri);
+        if (res && (res.id || res.path)) setOpenTarget(res);
+      } catch { /* URI illisible */ }
+    };
+    Linking.getInitialURL().then(handle).catch(() => {});
+    const sub = Linking.addEventListener('url', e => handle(e.url));
+    return () => sub.remove();
+  }, []);
+
+  // Quand une cible est en attente ET que la bibliothèque est prête : on retrouve
+  // la piste (par id, puis chemin, puis nom de fichier) et on la joue.
+  useEffect(() => {
+    if (!openTarget || scanState !== 'done') return;
+    const {id, path} = openTarget;
+    const base = path ? path.split('/').pop() : null;
+    const track =
+      (id ? tracks.find(t => t.id === id) : undefined) ??
+      (path ? tracks.find(t => t.filePath === path) : undefined) ??
+      (base ? tracks.find(t => !!t.filePath && t.filePath.endsWith('/' + base)) : undefined) ??
+      null;
+    setOpenTarget(null);
+    if (track) openTrack(track, tracks);
+    else Alert.alert('Fichier introuvable', "Ce morceau n'est pas dans la bibliothèque scannée. Lance un scan dans les Réglages si besoin.");
+  }, [openTarget, tracks, scanState, openTrack]);
+
   return (
     <ThemeCtx.Provider value={colors}>
-    <SafeAreaView style={S.root} edges={['bottom']}>
-      <StatusBar barStyle={colors.barStyle} backgroundColor={colors.statusBg}/>
+    <View style={{flex:1, backgroundColor: blurBg ? '#000' : colors.bg}}>
+      <StatusBar barStyle={colors.barStyle} backgroundColor="transparent" translucent/>
+
+      {/* Thème « Flou » : backdrop plein écran (edge-to-edge) = pochette courante
+          zoomée + floutée, + voile sombre. En fond, n'intercepte pas les gestes. */}
+      {blurBg && (
+        <View style={StyleSheet.absoluteFill} pointerEvents="none">
+          {currentTrack?.artUri && (
+            <Image source={{uri: currentTrack.artUri}} blurRadius={40} resizeMode="cover" style={StyleSheet.absoluteFill}/>
+          )}
+          <View style={[StyleSheet.absoluteFill, {backgroundColor:'#00000073'}]}/>
+        </View>
+      )}
+
+      {/* Contenu principal : décalé de la barre de statut (haut) seulement.
+          Pas d'inset bas → la barre de nav de l'app descend jusqu'au bord de
+          l'écran (nav par gestes : la fine barre système se superpose sans gêner). */}
+      <SafeAreaView style={{flex:1}} edges={['top']}>
 
       {/* Bannière de scan en haut */}
       {scanState === 'scanning' && (
@@ -2530,6 +3143,10 @@ export default function App() {
           <Text style={[S.scanText, {color:colors.accent}]}>Permission refusée — appuyer pour réessayer</Text>
         </TouchableOpacity>
       )}
+      {/* Dégagement de la barre de statut quand aucune bannière n'occupe le haut */}
+      {!(scanState === 'scanning' || (scanState === 'done' && scanCount > 0) || scanState === 'denied') && (
+        <View style={{height:38}}/>
+      )}
 
       {page === 0 && <LibraryPage tracks={tracks} onTrackPress={openTrack} navIntent={libNav} onNavConsumed={() => setLibNav(null)}/>}
       {page === 1 && <FavoritesPage tracks={tracks} onTrackPress={openTrack}/>}
@@ -2538,6 +3155,8 @@ export default function App() {
           theme={theme}     setTheme={setThemePref}
           eq={eq}           setEq={applyEqPreset}
           quality={quality} setQuality={setQualityPref}
+          crossfade={crossfade} setCrossfade={setCrossfadePref}
+          replayGain={replayGain} setReplayGain={setReplayGainPref}
           onScan={scan}     scanState={scanState}
           onOpenTags={() => setTagMgrOpen(true)}
         />
@@ -2551,16 +3170,29 @@ export default function App() {
           </TouchableOpacity>
         ))}
       </View>
-      {playerOpen && currentTrack && (
+      </SafeAreaView>
+
+      {/* Overlays plein écran : frères hors SafeAreaView pour couvrir aussi les
+          barres système (ils gèrent eux-mêmes leur marge haute). */}
+      {currentTrack && (
         <PlayerScreen
           track={currentTrack}
+          visible={playerOpen}
           onClose={() => setPlayerOpen(false)}
           eq={{range: peqRange, bands: eqBands, onGainLive, onGainCommit, onSetFreq, onAddBand, onRemoveBand, onReset: onResetBands}}
           onOpenEq={openBaseEq}
           onOpenSr={() => setSrOpen(true)}
+          onOpenLyrics={() => setLyricsOpen(true)}
           srActive={srActive}
+          blurBg={blurBg}
         />
       )}
+      <LyricsScreen
+        visible={lyricsOpen}
+        track={currentTrack}
+        onClose={() => setLyricsOpen(false)}
+        bright={getPalette(currentTrack?.genre).bright}
+      />
       <EqualizerScreen
         visible={eqOpen}
         onClose={closeBaseEq}
@@ -2637,7 +3269,7 @@ export default function App() {
       <TrackInfoModal track={infoTrack} onClose={() => setInfoTrack(null)}/>
       <SleepTimerModal visible={sleepOpen} current={sleepMin} onSelect={applySleep} onClose={() => setSleepOpen(false)}/>
       <AddToPlaylistSheet trackId={addPlTrackId} visible={!!addPlTrackId} onClose={() => setAddPlTrackId(null)}/>
-    </SafeAreaView>
+    </View>
     </ThemeCtx.Provider>
   );
 }
@@ -2648,11 +3280,14 @@ const makeS = (c: Colors) => StyleSheet.create({
   page:    {flex:1, backgroundColor:c.bg},
   content: {flex:1},
 
-  header:       {flexDirection:'row', alignItems:'center', justifyContent:'space-between', paddingHorizontal:16, paddingTop:52, paddingBottom:10},
+  header:       {flexDirection:'row', alignItems:'center', justifyContent:'space-between', paddingHorizontal:16, paddingTop:14, paddingBottom:10},
   headerTitle:  {fontSize:22, fontWeight:'600', color:c.text},
   headerRight:  {flexDirection:'row', gap:4},
   headerBtn:    {paddingHorizontal:8, height:36, alignItems:'center', justifyContent:'center'},
   headerBtnText:{color:c.textDim, fontSize:13},
+
+  searchBar:    {flexDirection:'row', alignItems:'center', gap:8, marginHorizontal:16, marginBottom:12, paddingHorizontal:12, height:40, borderRadius:10, backgroundColor:c.glass},
+  searchInput:  {flex:1, fontSize:14, color:c.text, padding:0},
 
   tabsScroll:{flexGrow:0, borderBottomWidth:0.5, borderBottomColor:c.border},
   tabs:      {flexDirection:'row'},
@@ -2681,6 +3316,9 @@ const makeS = (c: Colors) => StyleSheet.create({
   rowTitle:  {fontSize:13, fontWeight:'500', color:c.text},
   rowSub:    {fontSize:11, color:c.textFaint, marginTop:2},
   rowFormat: {fontSize:10, color:c.textFaint},
+  playCountBadge: {flexDirection:'row', alignItems:'center', gap:2, marginRight:10},
+  playCountText:  {fontSize:12, fontWeight:'600', color:c.textDim},
+  rowMove:   {paddingHorizontal:2, paddingVertical:8},
   rowDots:   {padding:8},
 
   empty:      {flex:1, alignItems:'center', justifyContent:'center', paddingTop:80, gap:8},
@@ -2693,14 +3331,14 @@ const makeS = (c: Colors) => StyleSheet.create({
   version:      {textAlign:'center', fontSize:13, color:c.textGhost, marginTop:32},
   versionSub:   {textAlign:'center', fontSize:12, color:c.textGhost, marginTop:4},
 
-  mini:       {flexDirection:'row', alignItems:'center', gap:10, backgroundColor:c.surface, paddingHorizontal:16, paddingVertical:10, borderTopWidth:0.5, borderTopColor:c.border},
+  mini:       {flexDirection:'row', alignItems:'center', gap:10, backgroundColor:c.glass, paddingHorizontal:16, paddingVertical:10, borderTopWidth:0.5, borderTopColor:c.border},
   miniCover:  {width:38, height:38, borderRadius:6, alignItems:'center', justifyContent:'center'},
   miniInfo:   {flex:1},
   miniTitle:  {fontSize:13, fontWeight:'500', color:c.text},
   miniArtist: {fontSize:11, color:c.textFaint, marginTop:1},
   miniBtn:    {padding:8},
 
-  navbar:  {flexDirection:'row', backgroundColor:c.bg, borderTopWidth:0.5, borderTopColor:c.border, paddingBottom:4},
+  navbar:  {flexDirection:'row', backgroundColor:c.glass, borderTopWidth:0.5, borderTopColor:c.border, paddingBottom:4},
   navItem: {flex:1, alignItems:'center', paddingTop:10, gap:4},
   navDot:  {width:4, height:4, borderRadius:2, backgroundColor:c.accent},
 

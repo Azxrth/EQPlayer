@@ -1,4 +1,5 @@
 import {useEffect, useReducer, useState} from 'react';
+import {Alert} from 'react-native';
 import TrackPlayer, {
   Capability,
   AppKilledPlaybackBehavior,
@@ -8,6 +9,8 @@ import TrackPlayer, {
 } from 'react-native-track-player';
 import {reapplySpeed} from './slowedReverb';
 import {applyForTrackId} from './eqTags';
+import {bumpPlayCount} from './usePlayCounts';
+import {readReplayGain, replayGainFactor, type RgMode} from './replayGain';
 // Hooks re-exportés via require pour contourner le bug exports:[] dans package.json
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const RNTP = require('react-native-track-player');
@@ -58,6 +61,103 @@ function repeatModeFor(mode: PlayMode): RepeatMode {
 
 let playerReady = false;
 
+// ─── Fondu enchaîné (fade-out fin de piste / fade-in début) ──────────────────
+// ExoPlayer (un seul moteur) joue la file en gapless mais ne superpose pas deux
+// morceaux : on ne peut pas faire un vrai crossfade. On fait donc un FONDU piloté
+// par le volume — le sortant descend, l'entrant remonte — ce qui adoucit le
+// passage entre morceaux de styles très différents. 0 s = gapless pur.
+let crossfadeSec = 0;
+let currentVol = 1;                 // facteur de FONDU courant (0..1), suivi pour les rampes
+let volRamp: ReturnType<typeof setInterval> | null = null;
+let fadingOut = false;              // on est dans le fondu de fin de la piste courante
+
+// ReplayGain : facteur d'atténuation propre à la piste (≤ 1). Le volume envoyé au
+// moteur est le PRODUIT fondu × ReplayGain, pour que les deux coexistent.
+let rgMode: RgMode = 'off';
+let rgFactor = 1;
+
+function applyVolume() {
+  TrackPlayer.setVolume(Math.max(0, Math.min(1, currentVol * rgFactor))).catch(() => {});
+}
+
+function stopRamp() {
+  if (volRamp) { clearInterval(volRamp); volRamp = null; }
+}
+
+// Rampe le facteur de fondu vers `to` en `ms`, par petits pas (fondu lisse).
+function rampVolume(to: number, ms: number) {
+  stopRamp();
+  const steps = Math.max(1, Math.round(ms / 40));
+  const from = currentVol;
+  let i = 0;
+  volRamp = setInterval(() => {
+    i++;
+    currentVol = Math.max(0, Math.min(1, from + (to - from) * (i / steps)));
+    applyVolume();
+    if (i >= steps) { stopRamp(); currentVol = to; }
+  }, 40);
+}
+
+// Règle la durée du fondu (secondes). 0 → gapless pur (facteur fondu = 1).
+export function setCrossfadeSec(sec: number) {
+  crossfadeSec = Math.max(0, sec);
+  if (crossfadeSec === 0) {
+    stopRamp();
+    fadingOut = false;
+    currentVol = 1;
+    applyVolume();
+  }
+}
+
+// Mode de normalisation ReplayGain + relecture immédiate pour la piste courante.
+export function setReplayGainMode(mode: RgMode) {
+  rgMode = mode;
+  if (mode === 'off') { rgFactor = 1; applyVolume(); return; }
+  void updateRgForActiveTrack();
+}
+
+// Lit le ReplayGain de la piste active et met à jour le facteur (puis applique).
+async function updateRgForActiveTrack() {
+  if (rgMode === 'off') { rgFactor = 1; applyVolume(); return; }
+  try {
+    const t: any = await TrackPlayer.getActiveTrack();
+    const gains = await readReplayGain(t?.filePath);
+    rgFactor = replayGainFactor(gains, rgMode);
+  } catch {
+    rgFactor = 1;
+  }
+  applyVolume();
+}
+
+// Fondu d'entrée au démarrage d'une nouvelle piste (+ relecture du ReplayGain).
+function fadeInNewTrack() {
+  fadingOut = false;
+  void updateRgForActiveTrack();
+  if (crossfadeSec <= 0) { currentVol = 1; applyVolume(); return; }
+  currentVol = 0;
+  applyVolume();
+  rampVolume(1, crossfadeSec * 1000);
+}
+
+// Piloté par la position (donc naturellement correct en pause/seek) : déclenche le
+// fondu de sortie quand il reste moins de `crossfadeSec` avant la fin ; restaure
+// le plein volume si on ressort de la zone (seek arrière).
+function onProgressForFade(position: number, duration: number) {
+  if (crossfadeSec <= 0 || !duration) return;
+  const remaining = duration - position;
+  if (!fadingOut && remaining <= crossfadeSec && remaining > 0.25) {
+    fadingOut = true;
+    rampVolume(0, remaining * 1000);
+  } else if (fadingOut && remaining > crossfadeSec + 0.5) {
+    fadingOut = false;
+    rampVolume(1, 200);
+  }
+}
+
+// Dernière piste comptée : PlaybackActiveTrackChanged peut se déclencher 2× de
+// suite pour la même piste → on ne compte qu'au changement réel de piste.
+let lastCountedTrackId: string | null = null;
+
 // Dernier état de lecture connu (mis à jour par l'écouteur Event.PlaybackState).
 // Évite à togglePlay un aller-retour getPlaybackState() avant d'agir.
 let lastPlaybackState: State | undefined;
@@ -107,6 +207,18 @@ export async function setupPlayer() {
     lastPlaybackState = e.state;
   });
 
+  // DIAGNOSTIC : ExoPlayer avale ses erreurs de lecture. Sans ce listener, une
+  // piste qui échoue (ex. FLAC haute-résolution que le codec matériel ne sait pas
+  // décoder) reste bloquée à 00:00/00:00 sans aucun message. On remonte le code +
+  // message natifs à l'écran pour pouvoir diagnostiquer.
+  TrackPlayer.addEventListener(Event.PlaybackError, (e: any) => {
+    console.warn('[TrackPlayer] PlaybackError', e);
+    Alert.alert(
+      'Lecture impossible',
+      `code: ${e?.code ?? '?'}\n${e?.message ?? 'erreur inconnue'}`,
+    );
+  });
+
   TrackPlayer.addEventListener(Event.PlaybackQueueEnded, async () => {
     if (currentMode === 'loop-once' && !loopOncePlayed) {
       loopOncePlayed = true;
@@ -117,10 +229,24 @@ export async function setupPlayer() {
 
   // À chaque changement de piste, on rallonge la fenêtre si on approche du bord
   // de ce qui est chargé. Petits ajouts (≤ WINDOW_BATCH), jamais de gros bloc.
+  // Fondu de sortie (piloté par la position via l'événement de progression).
+  TrackPlayer.addEventListener(Event.PlaybackProgressUpdated, (e: {position: number; duration: number}) => {
+    onProgressForFade(e.position, e.duration);
+  });
+
   TrackPlayer.addEventListener(Event.PlaybackActiveTrackChanged, () => {
+    fadeInNewTrack(); // fondu d'entrée de la nouvelle piste (no-op si crossfade = 0)
     void maybeExtendWindow();
-    // Applique l'EQ du morceau : son tag s'il en a un, sinon l'EQ de base.
-    void TrackPlayer.getActiveTrack().then(t => applyForTrackId((t as any)?.id ?? null)).catch(() => {});
+    // Applique l'EQ du morceau (tag sinon EQ de base) + incrémente le compteur
+    // de lectures (utilisé par l'onglet « + Joués »).
+    void TrackPlayer.getActiveTrack().then(t => {
+      const id = (t as any)?.id ?? null;
+      applyForTrackId(id);
+      if (id && String(id) !== lastCountedTrackId) {
+        lastCountedTrackId = String(id);
+        bumpPlayCount(String(id));
+      }
+    }).catch(() => {});
   });
 
   playerReady = true;
@@ -203,7 +329,10 @@ async function applyMode(mode: PlayMode, prev: PlayMode) {
 export function toPlayerTrack(t: any) {
   return {
     id:       t.id,
-    url:      t.id ? `content://media/external/audio/media/${t.id}`
+    // AIFF : ExoPlayer ne le décode pas → on passe par notre ContentProvider qui
+    // le sert comme du WAV (content://com.eqplayer.aiff/<id>).
+    url:      t.format === 'AIFF' && t.id ? `content://com.eqplayer.aiff/${t.id}`
+            : t.id ? `content://media/external/audio/media/${t.id}`
             : t.filePath ? `file://${t.filePath}` : '',
     title:    t.title,
     artist:   t.artist,
@@ -211,6 +340,7 @@ export function toPlayerTrack(t: any) {
     artwork:  t.artUri || undefined, // "" (pas de pochette) → undefined
     duration: t.duration ? t.duration / 1000 : undefined, // ms → secondes
     genre:    t.genre,
+    filePath: t.filePath, // conservé pour retrouver le .lrc voisin (paroles)
   };
 }
 
@@ -278,7 +408,22 @@ export async function togglePlay() {
 }
 
 export const skipNext = () => { setOptimistic(null); TrackPlayer.skipToNext().catch(() => {}); };
-export const skipPrev = () => { setOptimistic(null); TrackPlayer.skipToPrevious().catch(() => {}); };
+// « Précédent » à la manière des lecteurs classiques : un appui remet le morceau
+// au début ; ce n'est que dans les 3 premières secondes qu'on saute réellement
+// à la piste précédente.
+export const skipPrev = async () => {
+  try {
+    const { position } = await TrackPlayer.getProgress();
+    if (position > 3) {
+      await TrackPlayer.seekTo(0);
+      return;
+    }
+    setOptimistic(null);
+    await TrackPlayer.skipToPrevious();
+  } catch {
+    TrackPlayer.seekTo(0).catch(() => {});
+  }
+};
 export const seekTo   = (pos: number) => { TrackPlayer.seekTo(pos); };
 
 // ─── File « à suivre » (sur sourceQueue, donc TOUTE la file, pas la fenêtre) ──
@@ -307,6 +452,23 @@ export async function jumpToIndex(sourceIndex: number) {
   }
   await TrackPlayer.skip(sourceIndex).catch(() => {});
   await TrackPlayer.play();
+}
+
+// Déplace une piste À VENIR dans la file (indices sourceQueue). On ne touche
+// jamais au morceau courant ni à ce qui est déjà passé (indices ≤ courant). On
+// réordonne sourceQueue puis on reconstruit la fenêtre « à venir » du player.
+export async function moveInQueue(fromSourceIndex: number, toSourceIndex: number) {
+  const idx = (await TrackPlayer.getActiveTrackIndex()) ?? 0;
+  if (fromSourceIndex <= idx || toSourceIndex <= idx) return;
+  if (fromSourceIndex < 0 || fromSourceIndex >= sourceQueue.length) return;
+  if (toSourceIndex < 0 || toSourceIndex >= sourceQueue.length) return;
+  if (fromSourceIndex === toSourceIndex) return;
+  const [moved] = sourceQueue.splice(fromSourceIndex, 1);
+  sourceQueue.splice(toSourceIndex, 0, moved);
+  // Hors aléatoire, l'ordre manuel devient le nouvel ordre de référence (sinon
+  // une sortie de shuffle le remplacerait par l'ordre canonique d'origine).
+  if (currentMode !== 'shuffle') canonicalQueue = [...sourceQueue];
+  await rebuildUpcoming();
 }
 
 // Retire une piste à venir (index sourceQueue) de la file.

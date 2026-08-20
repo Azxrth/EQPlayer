@@ -112,6 +112,22 @@ dependencies {
     // The version of react-native is set by the React Native Gradle Plugin
     implementation("com.facebook.react:react-android")
 
+    // Extension FLAC native (libFLAC) d'ExoPlayer, embarquée directement dans le
+    // module app (sources sous com.google.android.exoplayer2.ext.flac + .so dans
+    // jniLibs). Objectif : ExoPlayer (fourni par react-native-track-player via
+    // KotlinAudio) détecte cette extension par réflexion dans DefaultExtractorsFactory
+    // et l'utilise à la place de l'extracteur FLAC Java, plus strict. libFLAC
+    // resynchronise sur le sync code des frames et lit ainsi les FLAC dont
+    // l'octet-align entre métadonnées et audio est non standard (trou de zéros non
+    // déclaré), que l'extracteur Java rejette (« First frame does not start with
+    // sync code »). Version identique au runtime (2.19.0) apporté par KotlinAudio.
+    // compileOnly : les classes ExoPlayer sont déjà packagées au runtime.
+    compileOnly("com.google.android.exoplayer:exoplayer:2.19.0")
+    // Annotations de nullité (compile-only, aucun effet runtime) utilisées par les
+    // sources de l'extension FLAC. ExoPlayer les exclut de ses dépendances, donc on
+    // les fournit ici uniquement pour la compilation.
+    compileOnly("org.checkerframework:checker-qual:3.13.0")
+
     if (hermesEnabled.toBoolean()) {
         implementation("com.facebook.react:hermes-android")
     } else {
