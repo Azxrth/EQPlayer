@@ -30,6 +30,7 @@ import TrackPlayer from 'react-native-track-player';
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const {useActiveTrack} = require('react-native-track-player') as {useActiveTrack: () => import('react-native-track-player').Track | undefined};
 import {setupPlayer, usePlayer, useProgress, playTrack, addNext, seekTo, getUpNext, jumpToIndex, removeFromQueue, moveInQueue, setCrossfadeSec, setReplayGainMode} from './src/usePlayer';
+import {setupMediaKeys} from './src/mediaKeys';
 import type {RgMode} from './src/replayGain';
 import {usePlaylists, createPlaylist, renamePlaylist, deletePlaylist, toggleTrack, removeTrack, moveTrack, type Playlist} from './src/usePlaylists';
 import {useFavorites, toggleFavorite} from './src/useFavorites';
@@ -2349,7 +2350,7 @@ const SettingsPage = ({theme, setTheme, eq, setEq, quality, setQuality, crossfad
     {label:'Qualité audio',          value: quality, onPress: () => open('Qualité audio', QUALITY_OPTS, quality, setQuality)},
     {label:'Fondu enchaîné',         value: crossfade, onPress: () => open('Fondu enchaîné', CROSSFADE_OPTS, crossfade, setCrossfade)},
     {label:'Normalisation du volume', value: replayGain, onPress: () => open('Normalisation du volume', REPLAYGAIN_OPTS, replayGain, setReplayGain)},
-    {label:'Scanner la bibliothèque', value: scanState === 'scanning' ? '…' : '↻', onPress: onScan},
+    {label:'Scanner la bibliothèque', value: scanState === 'scanning' ? '…' : '↻', onPress: () => onScan()},
     {label:'Dossiers surveillés',    value:'›', onPress: () => Alert.alert('Dossiers surveillés', 'Fonctionnalité à venir.')},
     {label:'À propos',               value:'›', onPress: () => Alert.alert('EQPlayer', 'Version 0.1.0\nLecteur de musique audiophile.\nDéveloppé avec amour.')},
   ];
@@ -2689,8 +2690,12 @@ export default function App() {
     [persist],
   );
 
-  // Init TrackPlayer une seule fois au démarrage
-  useEffect(() => { setupPlayer().catch(console.warn); }, []);
+  // Init TrackPlayer une seule fois au démarrage + écoute des boutons physiques
+  // (maintien suiv./préc. = seek dans le morceau, comme FiiO Music sur le JM21).
+  useEffect(() => {
+    setupPlayer().catch(console.warn);
+    setupMediaKeys();
+  }, []);
 
   // Charge les préférences + initialise l'égaliseur au démarrage
   useEffect(() => {
@@ -3138,7 +3143,7 @@ export default function App() {
         </View>
       )}
       {scanState === 'denied' && (
-        <TouchableOpacity style={S.scanBanner} onPress={scan}>
+        <TouchableOpacity style={S.scanBanner} onPress={() => scan()}>
           <MaterialCommunityIcons name="alert-circle" size={14} color={colors.accent} style={{marginRight:6}}/>
           <Text style={[S.scanText, {color:colors.accent}]}>Permission refusée — appuyer pour réessayer</Text>
         </TouchableOpacity>

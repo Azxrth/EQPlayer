@@ -407,7 +407,8 @@ export async function togglePlay() {
   else await TrackPlayer.pause();
 }
 
-export const skipNext = () => { setOptimistic(null); TrackPlayer.skipToNext().catch(() => {}); };
+export const skipNext     = () => { setOptimistic(null); TrackPlayer.skipToNext().catch(() => {}); };
+export const skipPrevAlways = () => { setOptimistic(null); TrackPlayer.skipToPrevious().catch(() => {}); };
 // « Précédent » à la manière des lecteurs classiques : un appui remet le morceau
 // au début ; ce n'est que dans les 3 premières secondes qu'on saute réellement
 // à la piste précédente.
@@ -425,6 +426,18 @@ export const skipPrev = async () => {
   }
 };
 export const seekTo   = (pos: number) => { TrackPlayer.seekTo(pos); };
+
+// Avance (delta > 0) ou recule (delta < 0) de `delta` secondes dans le morceau,
+// borné à [0, durée]. Utilisé par le maintien des boutons physiques suiv./préc.
+export const seekBy = async (delta: number) => {
+  try {
+    const {position, duration} = await TrackPlayer.getProgress();
+    let t = position + delta;
+    if (t < 0) t = 0;
+    if (duration && t > duration) t = Math.max(0, duration - 0.5);
+    await TrackPlayer.seekTo(t);
+  } catch { /* lecteur pas prêt */ }
+};
 
 // ─── File « à suivre » (sur sourceQueue, donc TOUTE la file, pas la fenêtre) ──
 
