@@ -43,8 +43,9 @@ let canonicalQueue: any[] = [];     // même contenu, ordre NON mélangé (pour 
 let windowLoaded = 0;               // nb de pistes de sourceQueue déjà dans le player
 let extending = false;              // anti-réentrance de l'extension de fenêtre
 const WINDOW_INITIAL = 50;          // pistes chargées d'avance au lancement
-const WINDOW_AHEAD = 20;            // on rallonge quand il reste moins que ça devant
-const WINDOW_BATCH = 50;            // taille d'un rallongement
+const WINDOW_AHEAD  = 20;           // on rallonge quand il reste moins que ça devant
+const WINDOW_BATCH  = 50;           // taille d'un rallongement
+const WINDOW_BACK   = 10;           // pistes avant le morceau cliqué pré-chargées (accès « précédent »)
 let loopOncePlayed = false;         // a-t-on déjà fait la répétition unique en 'loop-once' ?
 const modeSubscribers = new Set<(m: PlayMode) => void>();
 function notifyMode() {
@@ -179,7 +180,12 @@ export async function setupPlayer() {
   // maxCacheSize active un CacheDataSource pensé pour le streaming réseau ;
   // sur des fichiers locaux il ajoute une couche de lecture/copie qui peut
   // bloquer le lecteur en « Buffering » plusieurs secondes avant de démarrer.
-  await TrackPlayer.setupPlayer();
+  await TrackPlayer.setupPlayer({
+    minBuffer: 15000,   // s'assure qu'ExoPlayer buffere assez pour éviter les micro-coupures
+    maxBuffer: 50000,   // plafond haut : fichiers locaux, la RAM du JM21 le supporte
+    playBuffer: 200,    // reprend dès 200 ms de buffer prêt (défaut 2500 = pensé réseau)
+    backBuffer: 30000,  // garde 30 s derrière → seeks backward sans rebuffering
+  });
   await TrackPlayer.updateOptions({
     android: {
       appKilledPlaybackBehavior: AppKilledPlaybackBehavior.StopPlaybackAndRemoveNotification,
@@ -358,18 +364,34 @@ export async function playTrack(track: any, queue: any[]) {
   setOptimistic(null); // nouveau morceau : on repart sur l'état réel
   await TrackPlayer.reset();
   const clickedIdx = queue.findIndex(t => t.id === track.id);
-  const ordered = clickedIdx >= 0
-    ? [...queue.slice(clickedIdx), ...queue.slice(0, clickedIdx)]
-    : [track, ...queue];
-  canonicalQueue = ordered; // ordre de référence (non mélangé) pour restaurer
-  // Ordre de lecture figé (mélangé d'emblée en mode aléatoire, sauf le 1er).
-  sourceQueue = currentMode === 'shuffle'
-    ? [ordered[0], ...shuffled(ordered.slice(1))]
-    : ordered;
+
+  let startOffset = 0; // index du morceau cliqué dans sourceQueue
+
+  if (currentMode === 'shuffle') {
+    // Shuffle : morceau cliqué en tête, reste mélangé (comportement inchangé).
+    const ordered = clickedIdx >= 0
+      ? [...queue.slice(clickedIdx), ...queue.slice(0, clickedIdx)]
+      : [track, ...queue];
+    canonicalQueue = ordered;
+    sourceQueue = [ordered[0], ...shuffled(ordered.slice(1))];
+  } else {
+    // Normal : on inclut jusqu'à WINDOW_BACK pistes avant le morceau cliqué
+    // pour que « précédent » fonctionne dès le premier appui.
+    const backCount  = clickedIdx > 0 ? Math.min(clickedIdx, WINDOW_BACK) : 0;
+    const queueStart = clickedIdx - backCount;
+    const ordered = clickedIdx >= 0
+      ? [...queue.slice(queueStart), ...queue.slice(0, queueStart)]
+      : [track, ...queue];
+    canonicalQueue = ordered;
+    sourceQueue    = ordered;
+    startOffset    = backCount; // le morceau cliqué est à cet index dans sourceQueue
+  }
+
   loopOncePlayed = false;
   windowLoaded = Math.min(WINDOW_INITIAL, sourceQueue.length);
   await TrackPlayer.add(sourceQueue.slice(0, windowLoaded).map(toPlayerTrack));
   await TrackPlayer.setRepeatMode(repeatModeFor(currentMode));
+  if (startOffset > 0) await TrackPlayer.skip(startOffset);
   await TrackPlayer.play();
   // reset() a pu remettre l'ExoPlayer à la vitesse normale → on réapplique.
   reapplySpeed();
@@ -531,9 +553,18 @@ export function usePlayer() {
 
   const isPlaying = optimisticPlaying ?? realPlaying;
   // Pas de spinner tant qu'un état optimiste est affiché (on montre pause/play).
-  const isLoading = optimisticPlaying === null &&
-                    (playbackState.state === State.Loading ||
-                     playbackState.state === State.Buffering);
+  const rawLoading = optimisticPlaying === null &&
+                     (playbackState.state === State.Loading ||
+                      playbackState.state === State.Buffering);
+  // Délai d'1 s avant d'afficher le spinner : les seeks rapides (fichiers locaux)
+  // se résolvent en < 200 ms avec le nouveau playBuffer, donc le spinner n'apparaît
+  // jamais pour eux. Seuls les vrais chargements longs le déclenchent.
+  const [isLoading, setIsLoading] = useState(false);
+  useEffect(() => {
+    if (!rawLoading) { setIsLoading(false); return; }
+    const t = setTimeout(() => setIsLoading(true), 1000);
+    return () => clearTimeout(t);
+  }, [rawLoading]);
 
   return {
     isPlaying,
